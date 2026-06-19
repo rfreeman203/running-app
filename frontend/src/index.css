@@ -1,0 +1,161 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --orange: #FF6B35;
+  --orange-dark: #e85a24;
+  --bg: #0F172A;
+  --surface: #1E293B;
+  --surface-2: #273549;
+  --border: #334155;
+  --text: #F8FAFC;
+  --text-muted: #94A3B8;
+  --strava: #FC4C02;
+  --green: #22C55E;
+  --radius: 12px;
+}
+
+html, body, #root {
+  height: 100%;
+  font-family: 'Inter', system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+  border: none;
+  outline: none;
+}
+
+a { color: inherit; text-decoration: none; }
+
+.nav-row-mobile { display: none; }
+.current-week-btn { order: -1; }
+
+@media (max-width: 768px) {
+  .page-root {
+    height: auto !important;
+    min-height: 100vh;
+    overflow: auto !important;
+  }
+
+  .main-content {
+    overflow: visible !important;
+    padding: 12px 12px !important;
+  }
+
+  .ov-grid {
+    flex-direction: column !important;
+    overflow: visible !important;
+  }
+
+  .ov-left-col {
+    min-height: unset !important;
+  }
+
+  .ov-card {
+    flex: unset !important;
+    min-height: unset !important;
+    overflow: visible !important;
+  }
+
+  .runs-card {
+    overflow: visible !important;
+  }
+
+  .runs-list {
+    overflow: visible !important;
+    max-height: none !important;
+  }
+
+  .header-inner {
+    padding: 0 16px !important;
+  }
+
+  .header-top-row {
+    padding: 10px 0 !important;
+  }
+
+  .plan-badge-desktop {
+    display: none;
+  }
+
+  .nav-desktop {
+    display: none !important;
+  }
+
+  .nav-row-mobile {
+    display: flex !important;
+  }
+
+  .user-name {
+    display: none;
+  }
+
+  .current-week-btn {
+    order: 0;
+  }
+
+  /* Calendar: half-height cells, relative so date can overlay */
+  .cal-cell {
+    position: relative !important;
+    min-height: 56px !important;
+  }
+
+  /* Calendar: stack detail panel below grid, full width */
+  .cal-layout {
+    flex-direction: column !important;
+    width: 100%;
+  }
+
+  .cal-layout > div:first-child {
+    width: 100%;
+  }
+
+  .cal-detail-panel {
+    width: 100% !important;
+  }
+
+  /* Orange square fills the full cell */
+  .cal-runs {
+    position: absolute !important;
+    inset: 0 !important;
+    flex: unset !important;
+    display: block !important;
+    border-radius: 0 !important;
+  }
+
+  .cal-run-pill {
+    position: absolute !important;
+    inset: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+    border-radius: 0 !important;
+    padding: 0 !important;
+    background: var(--orange) !important;
+  }
+
+  .cal-run-pill-active {
+    background: var(--orange-dark) !important;
+    outline: 2px solid white !important;
+    outline-offset: -2px;
+  }
+
+  /* Date number floats on top of the orange square */
+  .cal-cell > span {
+    position: relative;
+    z-index: 1;
+  }
+
+  /* White date text when a run fills the cell */
+  .cal-cell:has(.cal-run-pill) > span {
+    color: white !important;
+    background: none !important;
+  }
+
+  .cal-run-dist,
+  .cal-run-name {
+    display: none !important;
+  }
+}
