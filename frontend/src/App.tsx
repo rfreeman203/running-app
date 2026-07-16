@@ -31,7 +31,7 @@ export default function App() {
         <Route path="/connect-strava" element={
           !user ? <Navigate to="/login" replace /> : <ConnectStrava user={user} onConnected={setUser} />
         } />
-        <Route path="/strava-connected" element={<StravaCallback onDone={setUser} />} />
+        <Route path="/strava-connected" element={<StravaCallback />} />
         <Route path="/strava-error" element={<Navigate to="/connect-strava" replace />} />
         <Route path="/" element={
           <AuthGuard user={user ?? null}>

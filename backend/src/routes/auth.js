@@ -21,11 +21,11 @@ router.post('/google', async (req, res) => {
     });
     const { sub: googleId, email, name, picture } = ticket.getPayload();
 
-    let user = db.users.findBy('google_id', googleId);
+    let user = await db.users.findBy('google_id', googleId);
     if (!user) {
       const id = uuidv4();
-      db.users.insert({ id, email, name, picture, google_id: googleId });
-      user = db.users.findBy('id', id);
+      await db.users.insert({ id, email, name, picture, google_id: googleId });
+      user = await db.users.findBy('id', id);
     }
 
     const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, { expiresIn: '30d' });
@@ -88,7 +88,7 @@ router.get('/strava/callback', async (req, res) => {
 
     const { access_token, refresh_token, expires_at, athlete } = tokenRes.data;
 
-    db.users.update(userId, {
+    await db.users.update(userId, {
       strava_athlete_id: athlete.id,
       strava_access_token: access_token,
       strava_refresh_token: refresh_token,
@@ -102,13 +102,16 @@ router.get('/strava/callback', async (req, res) => {
   }
 });
 
-router.delete('/account', requireAuth, (req, res) => {
-  db.users.remove(req.userId);
+router.delete('/account', requireAuth, async (req, res) => {
+  await db.users.remove(req.userId);
+  await db.marathon_overview.removeByUserId(req.userId);
+  await db.training_weeks.removeByUserId(req.userId);
+  await db.run_reviews.removeByUserId(req.userId);
   res.json({ ok: true });
 });
 
-router.delete('/strava', requireAuth, (req, res) => {
-  db.users.update(req.userId, {
+router.delete('/strava', requireAuth, async (req, res) => {
+  await db.users.update(req.userId, {
     strava_athlete_id: null,
     strava_access_token: null,
     strava_refresh_token: null,
@@ -117,8 +120,8 @@ router.delete('/strava', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
-router.get('/me', requireAuth, (req, res) => {
-  const user = db.users.findBy('id', req.userId);
+router.get('/me', requireAuth, async (req, res) => {
+  const user = await db.users.findBy('id', req.userId);
   if (!user) return res.status(404).json({ error: 'User not found' });
   const { strava_access_token, strava_refresh_token, ...safe } = user;
   res.json({ ...safe, hasStrava: !!user.strava_athlete_id });

@@ -1,19 +1,24 @@
 {
   "name": "marathon-trainer-backend",
   "version": "1.0.0",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node src/index.js",
-    "dev": "nodemon src/index.js"
+    "dev": "nodemon src/index.js",
+    "migrate": "node scripts/migrate-json-to-pg.js"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.0",
     "axios": "^1.7.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.0",
     "express": "^4.19.0",
     "google-auth-library": "^9.9.0",
     "jsonwebtoken": "^9.0.2",
+    "pg": "^8.22.0",
     "uuid": "^9.0.0"
-
   },
   "devDependencies": {
     "nodemon": "^3.1.0"

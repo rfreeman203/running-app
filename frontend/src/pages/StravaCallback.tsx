@@ -1,21 +1,14 @@
 import { useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { api, saveToken, type User } from '../lib/api';
 
-interface Props {
-  onDone: (user: User) => void;
-}
-
-export default function StravaCallback({ onDone }: Props) {
+export default function StravaCallback() {
   const navigate = useNavigate();
 
   useEffect(() => {
-    api.auth.me()
-      .then((user) => {
-        onDone(user);
-        navigate('/', { replace: true });
-      })
-      .catch(() => navigate('/login', { replace: true }));
+    // The Strava flow is always a full-page redirect, so App.tsx has already
+    // fetched the fresh user (with hasStrava: true) before this mounts.
+    // Just navigate to "/" and let AuthGuard route accordingly.
+    navigate('/', { replace: true });
   }, []);
 
   return (
