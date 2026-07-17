@@ -592,9 +592,21 @@ router.post('/update-summaries', requireAuth, async (req, res) => {
     const weeks = await db.training_weeks.findByUserId(req.userId);
     if (!weeks.length) return res.status(409).json({ error: 'No training plan weeks' });
 
-    if (!initial && !force && last_activity_id != null
-        && String(last_activity_id) === overview.last_processed_activity_id) {
-      return res.json({ ok: true, skipped: true });
+    const activityUnchanged = last_activity_id != null
+      && String(last_activity_id) === overview.last_processed_activity_id;
+
+    if (!initial && !force && activityUnchanged) {
+      // No new Strava activity — but a workout may have quietly gone missed since we last
+      // checked (no run logged at all that day). Since the activity id hasn't moved, any
+      // workout dated after our last check is guaranteed unacknowledged, so don't skip.
+      const today = localISODate();
+      const lastChecked = overview.summaries_checked_date || '';
+      const hasUnacknowledgedMiss = today > lastChecked && weeks.some(w =>
+        (w.workouts ?? []).some(wo => wo.date < today && wo.date > lastChecked)
+      );
+      if (!hasUnacknowledgedMiss) {
+        return res.json({ ok: true, skipped: true });
+      }
     }
 
     let promise = summariesInflight.get(req.userId);
@@ -698,6 +710,7 @@ async function generateSummaries(userId, { initial = false } = {}) {
     plan_summary,
     // Stamp the newest fetched activity so the next dashboard load's detection call skips
     ...(activities[0] ? { last_processed_activity_id: String(activities[0].id) } : {}),
+    summaries_checked_date: today,
   });
   return { week_summary, plan_summary };
 }

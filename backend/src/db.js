@@ -49,9 +49,11 @@ async function init() {
       week_summary TEXT,
       plan_summary TEXT,
       last_processed_activity_id TEXT,
+      summaries_checked_date TEXT,
       created_at BIGINT,
       updated_at BIGINT
     );
+    ALTER TABLE marathon_overview ADD COLUMN IF NOT EXISTS summaries_checked_date TEXT;
 
     CREATE TABLE IF NOT EXISTS training_weeks (
       user_id TEXT NOT NULL,
@@ -90,7 +92,7 @@ async function init() {
 
 // Columns each table accepts for merge/insert (excludes primary-key columns).
 const USER_COLS = ['email', 'name', 'picture', 'google_id', 'strava_athlete_id', 'strava_access_token', 'strava_refresh_token', 'strava_token_expires_at'];
-const OVERVIEW_COLS = ['distance_km', 'race_date', 'goal_time', 'goal_pace', 'weekly_km', 'days_per_week', 'running_days', 'long_run_day', 'experience', 'training_style', 'notes', 'week_summary', 'plan_summary', 'last_processed_activity_id'];
+const OVERVIEW_COLS = ['distance_km', 'race_date', 'goal_time', 'goal_pace', 'weekly_km', 'days_per_week', 'running_days', 'long_run_day', 'experience', 'training_style', 'notes', 'week_summary', 'plan_summary', 'last_processed_activity_id', 'summaries_checked_date'];
 const REVIEW_COLS = ['activity_name', 'activity_date', 'summary', 'review_text'];
 
 // Keep only whitelisted keys whose value is defined (null is kept — it's an intentional clear).

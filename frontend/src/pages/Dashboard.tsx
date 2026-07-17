@@ -201,10 +201,11 @@ export default function Dashboard({ user, onSignOut }: Props) {
       setStats(st);
       setLoading(false);
 
-      // New-run detection: regenerate AI summaries when the newest activity changed.
-      // Fire-and-forget — the server skips (or dedupes in-flight) if nothing is new.
+      // New-run detection: regenerate AI summaries when the newest activity changed, or once per
+      // day regardless (so a missed/unlogged workout still gets acknowledged instead of leaving a
+      // stale "on track" summary). Fire-and-forget — the server skips if nothing needs updating.
       const newestId = acts[0] ? String(acts[0].id) : null;
-      if (plan && newestId && plan.last_processed_activity_id !== newestId) {
+      if (plan && newestId) {
         setSummariesPending(true);
         api.training.updateSummaries({ last_activity_id: newestId })
           .then(r => {
