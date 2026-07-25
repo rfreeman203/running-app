@@ -809,7 +809,10 @@ export default function Dashboard({ user, onSignOut }: Props) {
           if (ps !== null) setGenTime(fmtGoalTime(ps * distKm));
         }
 
-        const canGenerate = distKm > 0 && genDate;
+        const goalTimeSec = parseTimeToSeconds(genTime);
+        const goalTimeValid = goalTimeSec !== null && goalTimeSec > 0;
+        const goalTimeInvalid = genTime.trim() !== '' && !goalTimeValid;
+        const canGenerate = distKm > 0 && genDate && goalTimeValid;
 
         return (
           <div style={styles.overlay}>
@@ -874,6 +877,11 @@ export default function Dashboard({ user, onSignOut }: Props) {
                     />
                   </div>
                 </div>
+                {goalTimeInvalid
+                  ? <p style={{ color: 'var(--red, #dc2626)', fontSize: 12, margin: 0 }}>
+                      Enter a valid goal time ({distKm >= 21 ? 'h:mm:ss' : 'mm:ss'}).
+                    </p>
+                  : <p style={genStyles.hint}>Required — enter your target finish time.</p>}
               </div>
 
               <div style={genStyles.field}>
@@ -1279,7 +1287,7 @@ function PlanProgress({ raceDate, goalTime, distanceKey, customKm, createdAt, ac
   // Actual km run this week from Strava activities
   const weekDone = Math.round(
     activities
-      .filter(a => { const dk = dateKey(new Date(a.start_date)); return dk >= mondayKey && dk <= sundayKey && a.distance > 0; })
+      .filter(a => { const dk = dateKey(new Date(a.start_date)); return dk >= mondayKey && dk <= sundayKey && a.distance > 0 && (a.sport_type || a.type || '').includes('Run'); })
       .reduce((sum, a) => sum + a.distance / 1000, 0)
   );
   const weekPct = weekTarget ? Math.round((weekDone / weekTarget) * 100) : 0;
@@ -1716,7 +1724,7 @@ const ovStyles: Record<string, React.CSSProperties> = {
   aiSummary: { fontSize: 16, color: 'var(--text-muted)', lineHeight: 1.6, margin: 0, padding: '12px 0 0', flex: 1 },
   planStatRow: { display: 'flex', gap: 0, borderTop: '1px solid var(--border)', paddingTop: 16, marginTop: 4 },
   planStat: { flex: 1, display: 'flex', flexDirection: 'column', gap: 2, alignItems: 'center' },
-  planStatVal: { fontSize: 16, fontWeight: 700, color: 'var(--text)' },
+  planStatVal: { fontSize: 16, fontWeight: 700, color: 'var(--text)', textAlign: 'center' as const },
   planStatLbl: { fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase' as const },
   runsList: { flex: 1, overflowY: 'auto' as const, display: 'flex', flexDirection: 'column', gap: 10, paddingRight: 10 },
   empty: { color: 'var(--text-muted)', fontSize: 14, textAlign: 'center', padding: 24 },
