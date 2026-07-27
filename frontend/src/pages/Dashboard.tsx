@@ -1333,9 +1333,9 @@ function PlanProgress({ raceDate, goalTime, distanceKey, customKm, createdAt, ac
           <div style={ovStyles.progressSub}>
             {weekTarget !== null ? `${Math.max(0, weekTarget - weekDone)} km to go this week` : ''}
           </div>
-          {weekSummary
-            ? <p style={ovStyles.aiSummary}>{weekSummary}</p>
-            : summariesPending && <p style={{ ...ovStyles.aiSummary, fontStyle: 'italic', opacity: 0.6 }}>Generating your training summary…</p>}
+          {summariesPending
+            ? <p style={{ ...ovStyles.aiSummary, fontStyle: 'italic', opacity: 0.6 }}>Generating your training summary…</p>
+            : weekSummary && <p style={ovStyles.aiSummary}>{weekSummary}</p>}
         </div>
       )}
 
@@ -1355,9 +1355,9 @@ function PlanProgress({ raceDate, goalTime, distanceKey, customKm, createdAt, ac
               ? `${Math.round(plannedDoneKm)} km done · ${Math.round(totalKm - plannedDoneKm)} km remaining`
               : 'loading…'}
           </div>
-          {planSummary
-            ? <p style={ovStyles.aiSummary}>{planSummary}</p>
-            : summariesPending && <p style={{ ...ovStyles.aiSummary, fontStyle: 'italic', opacity: 0.6 }}>Generating your training summary…</p>}
+          {summariesPending
+            ? <p style={{ ...ovStyles.aiSummary, fontStyle: 'italic', opacity: 0.6 }}>Generating your training summary…</p>
+            : planSummary && <p style={ovStyles.aiSummary}>{planSummary}</p>}
         </div>
       )}
 
