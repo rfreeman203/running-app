@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
-import { BrowserRouter, Routes, Route, Navigate, useNavigate } from 'react-router-dom';
-import { api, getToken, type User } from './lib/api';
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { api, clearToken, getToken, type User } from './lib/api';
 import Login from './pages/Login';
 import ConnectStrava from './pages/ConnectStrava';
 import Dashboard from './pages/Dashboard';
@@ -16,10 +16,24 @@ export default function App() {
   const [user, setUser] = useState<User | null | undefined>(undefined);
 
   useEffect(() => {
-    if (!getToken()) { setUser(null); return; }
+    const token = getToken();
+    if (!token) { setUser(null); return; }
+
+    // Guard against a late `me()` result clobbering a newer session: the effect
+    // runs twice under StrictMode, and if the user signs in while an earlier
+    // call is still in flight its rejection would knock them back to /login.
+    let cancelled = false;
+    const stale = () => cancelled || getToken() !== token;
+
     api.auth.me()
-      .then(setUser)
-      .catch(() => setUser(null));
+      .then(u => { if (!stale()) setUser(u); })
+      .catch(() => {
+        if (stale()) return;
+        clearToken(); // the token is invalid/expired — don't retry it on reload
+        setUser(null);
+      });
+
+    return () => { cancelled = true; };
   }, []);
 
   if (user === undefined) return <Splash />;

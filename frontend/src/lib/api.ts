@@ -12,12 +12,17 @@ export function clearToken() {
   localStorage.removeItem(TOKEN_KEY);
 }
 
+const clientTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const token = getToken();
   const res = await fetch(path, {
     ...options,
     headers: {
       'Content-Type': 'application/json',
+      // The server clock is UTC in production; "today" must be resolved in the
+      // runner's zone so an evening run doesn't land on the next training day.
+      'X-Client-Timezone': clientTimezone,
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(options.headers as Record<string, string>),
     },

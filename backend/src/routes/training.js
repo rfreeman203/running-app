@@ -255,12 +255,70 @@ function localISODate(d = new Date()) {
   return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
 }
 
+// Today's date in the *runner's* timezone, sent by the frontend on every request.
+// The server clock is UTC in production, so deriving "today" from it rolls a Sunday
+// evening run over into Monday — which pushes current_week to the next plan week and
+// makes the summaries read the finished week as a brand new one.
+function clientToday(req) {
+  const tz = req.get('X-Client-Timezone');
+  if (tz) {
+    try {
+      // en-CA formats as YYYY-MM-DD
+      return new Intl.DateTimeFormat('en-CA', {
+        timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+      }).format(new Date());
+    } catch {
+      // Unknown/invalid zone — fall back to the server's own local date
+    }
+  }
+  return localISODate();
+}
+
 function isRunType(a) {
   return (a.sport_type || a.type || '').includes('Run');
 }
 
 function activityLocalDate(a) {
   return (a.start_date_local || a.start_date || '').slice(0, 10);
+}
+
+// Running workout types — the cross-training ones can't be made up by a run
+const RUN_WORKOUT_TYPES = ['easy', 'tempo', 'intervals', 'long', 'marathon_pace', 'strides', 'race'];
+
+// Close enough to call an unscheduled run a make-up: 20% of the planned distance,
+// capped at 2 km so long runs don't swallow everything, floored at 1 km so short
+// sessions aren't held to an unrealistically tight window.
+function distanceMatches(plannedKm, actualKm) {
+  if (!plannedKm || !actualKm) return false;
+  const tolerance = Math.max(1, Math.min(plannedKm * 0.2, 2));
+  return Math.abs(actualKm - plannedKm) <= tolerance;
+}
+
+// An unscheduled run is often the athlete making up a workout they missed earlier the
+// same week. Pair them on distance so the summaries and reviews credit the make-up
+// instead of reporting a missed session *and* a stray extra run.
+// Runs are walked oldest-first and each missed workout can only be claimed once.
+function matchMakeupRuns(missedWorkouts, runsInWeek, plannedDates) {
+  const unscheduled = runsInWeek
+    .filter(r => !plannedDates.has(r.date))
+    .sort((a, b) => a.date.localeCompare(b.date));
+
+  const claimed = new Set();
+  const pairs = [];
+  for (const run of unscheduled) {
+    const candidates = missedWorkouts.filter(m =>
+      !claimed.has(m.date)
+      && m.date < run.date
+      && RUN_WORKOUT_TYPES.includes(m.type)
+      && distanceMatches(m.km, run.km));
+    if (!candidates.length) continue;
+    // Closest planned distance wins when several missed workouts are in range
+    const best = candidates.reduce((a, b) =>
+      Math.abs(b.km - run.km) < Math.abs(a.km - run.km) ? b : a);
+    claimed.add(best.date);
+    pairs.push({ missed: best, run });
+  }
+  return pairs;
 }
 
 const REVIEW_RUN_SCHEMA = {
@@ -290,6 +348,7 @@ The user message contains the activity (with precomputed metrics and per-km spli
 
 **What was planned**
 One sentence: the planned workout for that day. If none was scheduled, say so explicitly ("No scheduled workout — ...") and treat the activity as cross-training, a rest-day activity, or an unscheduled session.
+If \`possible_makeup_for\` is present, the distance matches a workout the athlete missed earlier this week — read the run as making up that session ("No scheduled workout — but this covers Tuesday's missed 8 km easy run") and judge it against that workout's intent in the sections below. Credit it as the week getting back on track rather than as a missed session plus an extra run.
 
 **What you did**
 Two to three sentences covering the key stats for the sport type: distance or duration, pace/speed, elevation, HR zone. If the athlete wrote a Strava description, reference it directly ("You noted: '...'").
@@ -347,27 +406,55 @@ function summarizeActivityForReview(activity) {
   return out;
 }
 
-async function buildReviewContext(userId, activityDate) {
+async function buildReviewContext(userId, activityDate, activity = null) {
   const overview = await db.marathon_overview.findByUserId(userId);
   const weeks = await db.training_weeks.findByUserId(userId);
+
+  // Match on the week's date range, not on a planned workout landing that day — an
+  // unscheduled run still belongs to a training week and needs its context.
+  const week = weeks.find(w => w.week_start <= activityDate && activityDate <= w.week_end) ?? null;
+  const weekContext = week ? {
+    week_number: week.week_number,
+    phase: week.phase,
+    total_km: week.total_km,
+    week_start: week.week_start,
+    week_end: week.week_end,
+  } : null;
+
   let plannedWorkout = null;
-  let weekContext = null;
   let nextWorkout = null;
-  for (const week of weeks) {
-    for (const w of week.workouts ?? []) {
-      if (w.date === activityDate) {
-        plannedWorkout = w;
-        weekContext = {
-          week_number: week.week_number,
-          phase: week.phase,
-          total_km: week.total_km,
-          week_start: week.week_start,
-          week_end: week.week_end,
-        };
-      }
+  for (const wk of weeks) {
+    for (const w of wk.workouts ?? []) {
+      if (w.date === activityDate) plannedWorkout = w;
       if (w.date > activityDate && (!nextWorkout || w.date < nextWorkout.date)) nextWorkout = w;
     }
   }
+
+  // Unscheduled run: it may be making up a workout missed earlier in the same week
+  let missedEarlier = null;
+  let possibleMakeupFor = null;
+  if (week && !plannedWorkout && activity && isRunType(activity)) {
+    try {
+      const weekRuns = await fetchWeekRuns(userId, week);
+      const loggedDates = new Set(weekRuns.map(r => r.date));
+      missedEarlier = (week.workouts ?? []).filter(w =>
+        w.date < activityDate
+        && RUN_WORKOUT_TYPES.includes(w.type)
+        && !loggedDates.has(w.date));
+
+      const thisRun = {
+        date: activityDate,
+        name: activity.name,
+        km: +((activity.distance || 0) / 1000).toFixed(2),
+      };
+      const plannedDates = new Set((week.workouts ?? []).map(w => w.date));
+      const [pair] = matchMakeupRuns(missedEarlier, [thisRun], plannedDates);
+      possibleMakeupFor = pair?.missed ?? null;
+    } catch {
+      // Strava lookup failed — review without make-up context rather than failing outright
+    }
+  }
+
   return {
     runner: overview ? {
       goal_time: overview.goal_time,
@@ -380,7 +467,27 @@ async function buildReviewContext(userId, activityDate) {
     planned_workout: plannedWorkout,
     week_context: weekContext,
     next_workout: nextWorkout,
+    // Only present for unscheduled runs
+    missed_earlier_this_week: missedEarlier,
+    possible_makeup_for: possibleMakeupFor,
   };
+}
+
+// Runs logged inside a plan week. Bounds are padded a day either side because Strava
+// filters on UTC start_date while plan dates are local; the local date is filtered after.
+async function fetchWeekRuns(userId, week) {
+  const after = Math.floor(Date.parse(`${week.week_start}T00:00:00Z`) / 1000) - 86400;
+  const before = Math.floor(Date.parse(`${week.week_end}T00:00:00Z`) / 1000) + 2 * 86400;
+  const acts = await withStravaToken(userId, token =>
+    axios.get('https://www.strava.com/api/v3/athlete/activities', {
+      headers: { Authorization: `Bearer ${token}` },
+      params: { after, before, per_page: 50 },
+    }).then(r => r.data)
+  );
+  return acts
+    .filter(isRunType)
+    .map(a => ({ date: activityLocalDate(a), name: a.name, km: +((a.distance || 0) / 1000).toFixed(2) }))
+    .filter(r => r.date >= week.week_start && r.date <= week.week_end);
 }
 
 function buildReviewRunUserPrompt(activity, context, todayISO) {
@@ -407,6 +514,7 @@ const UPDATE_SUMMARIES_SYSTEM_PROMPT = `You are writing two short AI training su
 
 ## week_summary
 Assess this week's progress against the plan: km done vs planned so far, whether the week is on track / ahead / behind, and one concrete observation or encouragement based on the data.
+\`made_up_workouts\` are sessions the runner missed on the scheduled day but covered with an unscheduled run of matching distance later in the week - treat these as done, not missed, and acknowledge the shuffle briefly ("you moved Tuesday's 8 km to Thursday"). Only \`missed_workouts\` are genuinely missed. \`unscheduled_runs\` are extra runs that don't correspond to anything in the plan - note them as added volume.
 Example style: "You've run 14 of your planned 26 km so far this week with your long run still to come on Saturday — right on track. Three of five sessions are logged and you haven't missed anything critical. Keep the long run easy and the week is in good shape."
 
 ## plan_summary
@@ -539,7 +647,7 @@ router.post('/review/:activityId/generate', requireAuth, async (req, res) => {
     const key = `${req.userId}:${activityId}`;
     let promise = reviewInflight.get(key);
     if (!promise) {
-      promise = generateRunReview(req.userId, activityId).finally(() => reviewInflight.delete(key));
+      promise = generateRunReview(req.userId, activityId, clientToday(req)).finally(() => reviewInflight.delete(key));
       reviewInflight.set(key, promise);
     }
     const review = await promise;
@@ -554,10 +662,10 @@ router.post('/review/:activityId/generate', requireAuth, async (req, res) => {
   }
 });
 
-async function generateRunReview(userId, activityId) {
+async function generateRunReview(userId, activityId, today = localISODate()) {
   const activity = await fetchActivityDetail(userId, activityId);
   const activityDate = activityLocalDate(activity);
-  const context = await buildReviewContext(userId, activityDate);
+  const context = await buildReviewContext(userId, activityDate, activity);
 
   const stream = anthropic.messages.stream({
     model: REVIEW_MODEL,
@@ -565,7 +673,7 @@ async function generateRunReview(userId, activityId) {
     thinking: { type: 'adaptive' },
     system: REVIEW_RUN_SYSTEM_PROMPT,
     output_config: { format: { type: 'json_schema', schema: REVIEW_RUN_SCHEMA } },
-    messages: [{ role: 'user', content: buildReviewRunUserPrompt(activity, context, localISODate()) }],
+    messages: [{ role: 'user', content: buildReviewRunUserPrompt(activity, context, today) }],
   });
   const message = await stream.finalMessage();
 
@@ -599,7 +707,7 @@ router.post('/update-summaries', requireAuth, async (req, res) => {
       // No new Strava activity — but a workout may have quietly gone missed since we last
       // checked (no run logged at all that day). Since the activity id hasn't moved, any
       // workout dated after our last check is guaranteed unacknowledged, so don't skip.
-      const today = localISODate();
+      const today = clientToday(req);
       const lastChecked = overview.summaries_checked_date || '';
       const hasUnacknowledgedMiss = today > lastChecked && weeks.some(w =>
         (w.workouts ?? []).some(wo => wo.date < today && wo.date > lastChecked)
@@ -611,7 +719,8 @@ router.post('/update-summaries', requireAuth, async (req, res) => {
 
     let promise = summariesInflight.get(req.userId);
     if (!promise) {
-      promise = generateSummaries(req.userId, { initial }).finally(() => summariesInflight.delete(req.userId));
+      promise = generateSummaries(req.userId, { initial, today: clientToday(req) })
+        .finally(() => summariesInflight.delete(req.userId));
       summariesInflight.set(req.userId, promise);
     }
     const result = await promise;
@@ -624,7 +733,7 @@ router.post('/update-summaries', requireAuth, async (req, res) => {
   }
 });
 
-async function generateSummaries(userId, { initial = false } = {}) {
+async function generateSummaries(userId, { initial = false, today = localISODate() } = {}) {
   const overview = await db.marathon_overview.findByUserId(userId);
   const weeks = await db.training_weeks.findByUserId(userId);
 
@@ -635,7 +744,6 @@ async function generateSummaries(userId, { initial = false } = {}) {
     }).then(r => r.data)
   );
 
-  const today = localISODate();
   const currentWeek = weeks.find(w => w.week_start <= today && today <= w.week_end) ?? null;
 
   const activityDatesSet = new Set(activities.map(activityLocalDate));
@@ -653,7 +761,28 @@ async function generateSummaries(userId, { initial = false } = {}) {
       if (w.date >= today) continue;
       (activityDatesSet.has(w.date) ? completed : missed).push({ date: w.date, day: w.day, type: w.type, km: w.km });
     }
-    thisWeek = { km_run_so_far: kmRunSoFar, completed_workouts: completed, missed_workouts: missed };
+
+    // Credit unscheduled runs that make up a workout missed earlier in the week
+    const plannedDates = new Set((currentWeek.workouts ?? []).map(w => w.date));
+    const runsInWeek = activities.filter(a => isRunType(a) && inWeek(a)).map(a => ({
+      date: activityLocalDate(a),
+      name: a.name,
+      km: +((a.distance || 0) / 1000).toFixed(2),
+    }));
+    const pairs = matchMakeupRuns(missed, runsInWeek, plannedDates);
+    const madeUpDates = new Set(pairs.map(p => p.missed.date));
+
+    thisWeek = {
+      km_run_so_far: kmRunSoFar,
+      completed_workouts: completed,
+      missed_workouts: missed.filter(m => !madeUpDates.has(m.date)),
+      made_up_workouts: pairs.map(({ missed: m, run }) => ({
+        ...m,
+        made_up_by: { date: run.date, name: run.name, km: run.km },
+      })),
+      unscheduled_runs: runsInWeek
+        .filter(r => !plannedDates.has(r.date) && !pairs.some(p => p.run.date === r.date)),
+    };
   }
 
   const payload = {
@@ -738,7 +867,7 @@ router.post('/generate-plan', requireAuth, async (req, res) => {
     const overview = await db.marathon_overview.findByUserId(req.userId);
     if (!overview) return res.status(404).json({ error: 'No plan overview found' });
 
-    const todayISO = new Date().toISOString().slice(0, 10);
+    const todayISO = clientToday(req);
 
     const stream = anthropic.messages.stream({
       model: 'claude-opus-4-8',
@@ -848,7 +977,7 @@ router.post('/upload-plan', requireAuth, async (req, res) => {
     if (!blockType) return res.status(400).json({ error: 'Unsupported file type. Use PNG, JPEG, or PDF.' });
     if (!distance_km || !race_date) return res.status(400).json({ error: 'distance_km and race_date are required' });
 
-    const todayISO = new Date().toISOString().slice(0, 10);
+    const todayISO = clientToday(req);
     const overview = { distance_km, race_date };
 
     const stream = anthropic.messages.stream({
