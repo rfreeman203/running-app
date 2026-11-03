@@ -48,7 +48,7 @@ async function main() {
   const data = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
 
   // Rebuild the schema fresh so re-running always yields the current normalized layout.
-  await pool.query('DROP TABLE IF EXISTS workouts, run_reviews, training_weeks, marathon_overview, users CASCADE');
+  await pool.query('DROP TABLE IF EXISTS activities, workouts, run_reviews, training_weeks, marathon_overview, users CASCADE');
   await db.init();
 
   const users = data.users ?? [];

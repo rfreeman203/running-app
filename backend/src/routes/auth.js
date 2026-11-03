@@ -6,6 +6,7 @@ const { OAuth2Client } = require('google-auth-library');
 const { v4: uuidv4 } = require('uuid');
 const db = require('../db');
 const requireAuth = require('../middleware/requireAuth');
+const { clearUserState } = require('../stravaSync');
 
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
@@ -107,6 +108,8 @@ router.delete('/account', requireAuth, async (req, res) => {
   await db.marathon_overview.removeByUserId(req.userId);
   await db.training_weeks.removeByUserId(req.userId);
   await db.run_reviews.removeByUserId(req.userId);
+  await db.activities.removeByUserId(req.userId);
+  clearUserState(req.userId);
   res.json({ ok: true });
 });
 
@@ -116,7 +119,13 @@ router.delete('/strava', requireAuth, async (req, res) => {
     strava_access_token: null,
     strava_refresh_token: null,
     strava_token_expires_at: null,
+    strava_synced_at: null,
+    strava_covered_from: null,
+    activities_version: null,
   });
+  // The mirrored activities belong to that Strava account; a reconnect re-backfills
+  await db.activities.removeByUserId(req.userId);
+  clearUserState(req.userId);
   res.json({ ok: true });
 });
 

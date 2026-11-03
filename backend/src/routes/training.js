@@ -4,6 +4,9 @@ const axios = require('axios');
 const Anthropic = require('@anthropic-ai/sdk');
 const db = require('../db');
 const requireAuth = require('../middleware/requireAuth');
+const {
+  withStravaToken, syncActivities, ensureBackfilled, extendHistory, fetchRangeBefore, fetchActivityDetail, STRAVA_API,
+} = require('../stravaSync');
 
 const anthropic = new Anthropic();
 
@@ -274,6 +277,17 @@ function clientToday(req) {
   return localISODate();
 }
 
+// Strava `before` bound for a finished plan: activities dated after the plan's last
+// day are never fetched. Strava filters on UTC epoch, so allow 2 days of slack (any
+// timezone) and let callers trim exactly by local date with `withinPlan`.
+function planEndCutoff(planEnd) {
+  return Math.floor(Date.parse(`${planEnd}T00:00:00Z`) / 1000) + 2 * 86400;
+}
+
+function withinPlan(activities, planEnd) {
+  return planEnd ? activities.filter(a => activityLocalDate(a) <= planEnd) : activities;
+}
+
 function isRunType(a) {
   return (a.sport_type || a.type || '').includes('Run');
 }
@@ -473,21 +487,12 @@ async function buildReviewContext(userId, activityDate, activity = null) {
   };
 }
 
-// Runs logged inside a plan week. Bounds are padded a day either side because Strava
-// filters on UTC start_date while plan dates are local; the local date is filtered after.
+// Runs logged inside a plan week (local dates), from the synced activities table
 async function fetchWeekRuns(userId, week) {
-  const after = Math.floor(Date.parse(`${week.week_start}T00:00:00Z`) / 1000) - 86400;
-  const before = Math.floor(Date.parse(`${week.week_end}T00:00:00Z`) / 1000) + 2 * 86400;
-  const acts = await withStravaToken(userId, token =>
-    axios.get('https://www.strava.com/api/v3/athlete/activities', {
-      headers: { Authorization: `Bearer ${token}` },
-      params: { after, before, per_page: 50 },
-    }).then(r => r.data)
-  );
+  const acts = await db.activities.between(userId, week.week_start, week.week_end);
   return acts
     .filter(isRunType)
-    .map(a => ({ date: activityLocalDate(a), name: a.name, km: +((a.distance || 0) / 1000).toFixed(2) }))
-    .filter(r => r.date >= week.week_start && r.date <= week.week_end);
+    .map(a => ({ date: activityLocalDate(a), name: a.name, km: +((a.distance || 0) / 1000).toFixed(2) }));
 }
 
 function buildReviewRunUserPrompt(activity, context, todayISO) {
@@ -535,86 +540,233 @@ Data:
 ${JSON.stringify(payload.data, null, 2)}`;
 }
 
-async function getFreshStravaToken(userId, { force = false } = {}) {
-  const user = await db.users.findBy('id', userId);
-  if (!user?.strava_access_token) throw Object.assign(new Error('Strava not connected'), { code: 'NO_STRAVA' });
-
-  const isExpired = force || Math.floor(Date.now() / 1000) > user.strava_token_expires_at - 300;
-  if (!isExpired) return user.strava_access_token;
-
-  const res = await axios.post('https://www.strava.com/oauth/token', {
-    client_id: process.env.STRAVA_CLIENT_ID,
-    client_secret: process.env.STRAVA_CLIENT_SECRET,
-    refresh_token: user.strava_refresh_token,
-    grant_type: 'refresh_token',
-  });
-
-  await db.users.update(userId, {
-    strava_access_token: res.data.access_token,
-    strava_refresh_token: res.data.refresh_token,
-    strava_token_expires_at: res.data.expires_at,
-  });
-
-  return res.data.access_token;
-}
-
-// Calls fn(token) and retries once with a force-refreshed token on 401
-async function withStravaToken(userId, fn) {
-  const token = await getFreshStravaToken(userId);
-  try {
-    return await fn(token);
-  } catch (err) {
-    if (err.response?.status !== 401) throw err;
-    const fresh = await getFreshStravaToken(userId, { force: true });
-    return await fn(fresh);
-  }
-}
-
-// Detailed activity: includes description, average/max HR, splits_metric, laps
-function fetchActivityDetail(userId, activityId) {
-  return withStravaToken(userId, token =>
-    axios.get(`https://www.strava.com/api/v3/activities/${activityId}`, {
-      headers: { Authorization: `Bearer ${token}` },
-    }).then(r => r.data)
-  );
-}
-
 // Single-process guards so concurrent dashboard loads share one generation instead of double-billing
 const reviewInflight = new Map();     // "userId:activityId" -> Promise<review>
 const summariesInflight = new Map();  // userId -> Promise<{week_summary, plan_summary}>
 
+// Stored activities, newest first, in Strava's own paging shape. Plan-end trimming
+// (planEndCutoff/withinPlan) applies exactly as it did when this proxied Strava.
+async function listActivities(userId, { page = 1, perPage = 20, after = null, before = null } = {}) {
+  const planEnd = await db.training_weeks.lastWeekEnd(userId);
+  if (planEnd) {
+    const cutoff = planEndCutoff(planEnd);
+    if (after && after >= cutoff) return [];
+    if (!before || before > cutoff) before = cutoff;
+  }
+  await ensureBackfilled(userId);
+  if (after) {
+    const user = await db.users.findBy('id', userId);
+    await fetchRangeBefore(userId, user?.strava_covered_from, { after, before });
+  }
+  const query = () => db.activities.list(userId, { before, after, limit: perPage, offset: (page - 1) * perPage });
+  let data = await query();
+  // Paging past stored history ("load more"): pull older runs from Strava and keep them
+  for (let i = 0; i < 3 && !after && data.length < perPage && await extendHistory(userId); i++) data = await query();
+  return withinPlan(data, planEnd);
+}
+
+function stravaErrorResponse(res, err, label) {
+  if (err.code === 'NO_STRAVA') return res.status(403).json({ error: 'Strava not connected' });
+  const stravaError = err.response?.data;
+  console.error(`${label} error:`, stravaError ?? err.message);
+  res.status(err.response?.status ?? 500).json({ error: `Failed to ${label.toLowerCase()}`, detail: stravaError });
+}
+
 router.get('/activities', requireAuth, async (req, res) => {
   try {
-    const { page = 1, per_page = 20, before, after } = req.query;
-    const data = await withStravaToken(req.userId, token =>
-      axios.get('https://www.strava.com/api/v3/athlete/activities', {
-        headers: { Authorization: `Bearer ${token}` },
-        params: { page, per_page, ...(before ? { before } : {}), ...(after ? { after } : {}) },
-      }).then(r => r.data)
-    );
-    res.json(data);
+    res.json(await listActivities(req.userId, {
+      page: Math.max(1, Number(req.query.page) || 1),
+      perPage: Math.min(200, Math.max(1, Number(req.query.per_page) || 20)),
+      after: req.query.after ? Number(req.query.after) : null,
+      before: req.query.before ? Number(req.query.before) : null,
+    }));
   } catch (err) {
-    if (err.code === 'NO_STRAVA') return res.status(403).json({ error: 'Strava not connected' });
-    const stravaError = err.response?.data;
-    console.error('Activities error:', stravaError ?? err.message);
-    res.status(err.response?.status ?? 500).json({ error: 'Failed to fetch activities', detail: stravaError });
+    stravaErrorResponse(res, err, 'Fetch activities');
   }
 });
 
+// Pull new/edited/deleted activities from Strava into the local table. The dashboard calls
+// this once per load (and on tab refocus) in parallel with its DB-backed reads, and only
+// refetches when `changed` comes back true.
+router.post('/sync', requireAuth, async (req, res) => {
+  try {
+    res.json({ ok: true, ...(await syncActivities(req.userId)) });
+  } catch (err) {
+    stravaErrorResponse(res, err, 'Sync activities');
+  }
+});
+
+// Everything the dashboard needs for first paint, in one round trip from the DB
+router.get('/bootstrap', requireAuth, async (req, res) => {
+  try {
+    const [plan, weeks, reviews] = await Promise.all([
+      db.marathon_overview.findByUserId(req.userId),
+      db.training_weeks.findByUserId(req.userId),
+      db.run_reviews.findByUserId(req.userId),
+    ]);
+    const recent_activities = await listActivities(req.userId, { perPage: 20 });
+    res.json({ plan, weeks, reviews, recent_activities });
+  } catch (err) {
+    stravaErrorResponse(res, err, 'Load dashboard');
+  }
+});
+
+// Athlete totals only prefill the Generate-plan form, so an hour-old copy is fine
+const statsCache = new Map(); // userId -> { at, data }
+
 router.get('/stats', requireAuth, async (req, res) => {
   try {
+    const hit = statsCache.get(req.userId);
+    if (hit && Date.now() - hit.at < 3600_000) return res.json(hit.data);
     const user = await db.users.findBy('id', req.userId);
     const data = await withStravaToken(req.userId, token =>
-      axios.get(`https://www.strava.com/api/v3/athletes/${user.strava_athlete_id}/stats`, {
+      axios.get(`${STRAVA_API}/athletes/${user.strava_athlete_id}/stats`, {
         headers: { Authorization: `Bearer ${token}` },
       }).then(r => r.data)
     );
+    statsCache.set(req.userId, { at: Date.now(), data });
     res.json(data);
   } catch (err) {
     if (err.code === 'NO_STRAVA') return res.status(403).json({ error: 'Strava not connected' });
     const stravaError = err.response?.data;
     console.error('Stats error:', stravaError ?? err.message);
     res.status(err.response?.status ?? 500).json({ error: 'Failed to fetch stats', detail: stravaError });
+  }
+});
+
+// Same % of max HR bands the run-review prompt uses
+const HR_ZONES = [
+  { zone: 1, name: 'Easy', max: 0.65 },
+  { zone: 2, name: 'Aerobic', max: 0.75 },
+  { zone: 3, name: 'Tempo', max: 0.85 },
+  { zone: 4, name: 'Threshold', max: 0.92 },
+  { zone: 5, name: 'VO2 max', max: Infinity },
+];
+const DEFAULT_MAX_HR = 190;
+
+// Plan-vs-actual stats for the Insights page: workout completion, weekly mileage,
+// heart rate and time-in-zone. All derived from the plan + Strava summaries, no AI.
+router.get('/insights', requireAuth, async (req, res) => {
+  try {
+    const weeks = (await db.training_weeks.findByUserId(req.userId))
+      .slice()
+      .sort((a, b) => a.week_start.localeCompare(b.week_start));
+    if (!weeks.length) return res.status(404).json({ error: 'No plan found' });
+
+    const today = clientToday(req);
+    const planStart = weeks[0].week_start;
+    const planEnd = weeks[weeks.length - 1].week_end;
+    const rangeEnd = today < planEnd ? today : planEnd;
+
+    await ensureBackfilled(req.userId);
+    const activities = today < planStart ? [] : await db.activities.between(req.userId, planStart, rangeEnd);
+    const activityDates = new Set(activities.map(activityLocalDate));
+    const runs = activities.filter(isRunType);
+
+    // ── Workout completion ──
+    const workoutStatus = { done: 0, made_up: 0, missed: 0, left: 0 };
+    const byType = {};
+    const weekly = [];
+    for (const week of weeks) {
+      const workouts = week.workouts ?? [];
+      const done = [];
+      const missed = [];
+      for (const w of workouts) {
+        if (activityDates.has(w.date)) done.push(w);
+        else if (w.date < today) missed.push(w);
+        else workoutStatus.left++;
+      }
+
+      const inWeek = r => {
+        const d = activityLocalDate(r);
+        return d >= week.week_start && d <= week.week_end;
+      };
+      const weekRuns = runs.filter(inWeek);
+      const pairs = matchMakeupRuns(
+        missed,
+        weekRuns.map(r => ({ date: activityLocalDate(r), name: r.name, km: +((r.distance || 0) / 1000).toFixed(2) })),
+        new Set(workouts.map(w => w.date)),
+      );
+      const madeUpDates = new Set(pairs.map(p => p.missed.date));
+      workoutStatus.done += done.length;
+      workoutStatus.made_up += pairs.length;
+      workoutStatus.missed += missed.length - pairs.length;
+
+      for (const w of workouts) {
+        if (w.date >= today && !activityDates.has(w.date)) continue; // not due yet
+        const t = (byType[w.type] ??= { type: w.type, due: 0, completed: 0 });
+        t.due++;
+        if (activityDates.has(w.date) || madeUpDates.has(w.date)) t.completed++;
+      }
+
+      const started = week.week_start <= today;
+      weekly.push({
+        week_number: week.week_number,
+        week_start: week.week_start,
+        phase: week.phase,
+        planned_km: +workouts.reduce((s, w) => s + (w.km || 0), 0).toFixed(1),
+        actual_km: started ? +(weekRuns.reduce((s, r) => s + (r.distance || 0), 0) / 1000).toFixed(1) : null,
+        runs: started ? weekRuns.length : null,
+      });
+    }
+
+    // ── Heart rate & zones ──
+    // Max HR isn't in the activity summaries' athlete scope, so take the highest seen
+    // in-plan — a reasonable proxy once a few hard sessions are logged.
+    const observedMax = Math.max(0, ...runs.map(r => r.max_heartrate || 0));
+    const maxHr = observedMax >= 150 ? Math.round(observedMax) : DEFAULT_MAX_HR;
+    const zones = HR_ZONES.map((z, i) => ({
+      zone: z.zone,
+      name: z.name,
+      min_bpm: i === 0 ? null : Math.round(HR_ZONES[i - 1].max * maxHr),
+      max_bpm: Number.isFinite(z.max) ? Math.round(z.max * maxHr) : null,
+      seconds: 0,
+      runs: 0,
+    }));
+
+    const plannedTypeByDate = new Map(weeks.flatMap(w => w.workouts ?? []).map(w => [w.date, w.type]));
+    const runRows = runs
+      .map(r => {
+        const row = {
+          id: String(r.id),
+          date: activityLocalDate(r),
+          name: r.name,
+          km: +((r.distance || 0) / 1000).toFixed(2),
+          moving_time: r.moving_time || 0,
+          pace_sec: r.distance > 0 ? Math.round(r.moving_time / (r.distance / 1000)) : null,
+          avg_hr: r.average_heartrate ? Math.round(r.average_heartrate) : null,
+          max_hr: r.max_heartrate ? Math.round(r.max_heartrate) : null,
+          elevation_m: r.total_elevation_gain ?? 0,
+          planned_type: plannedTypeByDate.get(activityLocalDate(r)) ?? null,
+        };
+        if (row.avg_hr) {
+          const pct = row.avg_hr / maxHr;
+          const z = zones[HR_ZONES.findIndex(hz => pct < hz.max)];
+          z.seconds += row.moving_time;
+          z.runs++;
+        }
+        return row;
+      })
+      .sort((a, b) => a.date.localeCompare(b.date));
+
+    res.json({
+      today,
+      plan_start: planStart,
+      plan_end: planEnd,
+      total_weeks: weeks.length,
+      workouts: workoutStatus,
+      by_type: Object.values(byType),
+      weekly,
+      runs: runRows,
+      max_hr: maxHr,
+      max_hr_source: observedMax >= 150 ? 'observed' : 'default',
+      zones,
+    });
+  } catch (err) {
+    if (err.code === 'NO_STRAVA') return res.status(403).json({ error: 'Strava not connected' });
+    const stravaError = err.response?.data;
+    console.error('Insights error:', stravaError ?? err.message);
+    res.status(err.response?.status ?? 500).json({ error: 'Failed to load insights', detail: stravaError });
   }
 });
 
@@ -647,7 +799,8 @@ router.post('/review/:activityId/generate', requireAuth, async (req, res) => {
     const key = `${req.userId}:${activityId}`;
     let promise = reviewInflight.get(key);
     if (!promise) {
-      promise = generateRunReview(req.userId, activityId, clientToday(req)).finally(() => reviewInflight.delete(key));
+      promise = generateRunReview(req.userId, activityId, clientToday(req), { fresh: refresh })
+        .finally(() => reviewInflight.delete(key));
       reviewInflight.set(key, promise);
     }
     const review = await promise;
@@ -662,8 +815,8 @@ router.post('/review/:activityId/generate', requireAuth, async (req, res) => {
   }
 });
 
-async function generateRunReview(userId, activityId, today = localISODate()) {
-  const activity = await fetchActivityDetail(userId, activityId);
+async function generateRunReview(userId, activityId, today = localISODate(), { fresh = false } = {}) {
+  const activity = await fetchActivityDetail(userId, activityId, { fresh });
   const activityDate = activityLocalDate(activity);
   const context = await buildReviewContext(userId, activityDate, activity);
 
@@ -693,26 +846,24 @@ async function generateRunReview(userId, activityId, today = localISODate()) {
 
 router.post('/update-summaries', requireAuth, async (req, res) => {
   try {
-    const { initial = false, last_activity_id, force = false } = req.body ?? {};
+    const { initial = false, force = false } = req.body ?? {};
 
     const overview = await db.marathon_overview.findByUserId(req.userId);
     if (!overview) return res.status(404).json({ error: 'No plan found' });
     const weeks = await db.training_weeks.findByUserId(req.userId);
     if (!weeks.length) return res.status(409).json({ error: 'No training plan weeks' });
 
-    const activityUnchanged = last_activity_id != null
-      && String(last_activity_id) === overview.last_processed_activity_id;
-
-    if (!initial && !force && activityUnchanged) {
-      // No new Strava activity — but a workout may have quietly gone missed since we last
-      // checked (no run logged at all that day). Since the activity id hasn't moved, any
-      // workout dated after our last check is guaranteed unacknowledged, so don't skip.
-      const today = clientToday(req);
-      const lastChecked = overview.summaries_checked_date || '';
-      const hasUnacknowledgedMiss = today > lastChecked && weeks.some(w =>
-        (w.workouts ?? []).some(wo => wo.date < today && wo.date > lastChecked)
-      );
-      if (!hasUnacknowledgedMiss) {
+    // Regenerate only for a new in-plan activity. The newest is read from the DB (not taken
+    // from the client) and trimmed to the plan, so runs logged after a finished plan never
+    // trigger a regeneration.
+    if (!initial && !force) {
+      const planEnd = await db.training_weeks.lastWeekEnd(req.userId);
+      const [newest] = withinPlan(await db.activities.list(req.userId, {
+        limit: 10, // a few past the cutoff's 2-day slack, so withinPlan still leaves one
+        ...(planEnd ? { before: planEndCutoff(planEnd) } : {}),
+      }), planEnd);
+      const newestId = newest ? String(newest.id) : null;
+      if (newestId === (overview.last_processed_activity_id ?? null)) {
         return res.json({ ok: true, skipped: true });
       }
     }
@@ -737,12 +888,11 @@ async function generateSummaries(userId, { initial = false, today = localISODate
   const overview = await db.marathon_overview.findByUserId(userId);
   const weeks = await db.training_weeks.findByUserId(userId);
 
-  const activities = await withStravaToken(userId, token =>
-    axios.get('https://www.strava.com/api/v3/athlete/activities', {
-      headers: { Authorization: `Bearer ${token}` },
-      params: { per_page: 30 },
-    }).then(r => r.data)
-  );
+  const planEnd = weeks.reduce((end, w) => (w.week_end > end ? w.week_end : end), '') || null;
+  const activities = withinPlan(await db.activities.list(userId, {
+    limit: 30,
+    ...(planEnd ? { before: planEndCutoff(planEnd) } : {}),
+  }), planEnd);
 
   const currentWeek = weeks.find(w => w.week_start <= today && today <= w.week_end) ?? null;
 

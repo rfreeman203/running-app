@@ -1,4 +1,5 @@
 const { Pool, types } = require('pg');
+const { track } = require('./timing');
 
 // node-pg returns bigint (OID 20) and numeric (OID 1700) as strings by default.
 // All our values are well within 2^53, so parse them back to JS numbers.
@@ -17,6 +18,9 @@ const pool = new Pool({
   ssl: isLocal ? false : { rejectUnauthorized: false },
 });
 pool.on('error', err => console.error('Postgres pool error:', err.message));
+// Count query time toward the request's Server-Timing `db` bucket
+const rawQuery = pool.query.bind(pool);
+pool.query = (...args) => track('db', () => rawQuery(...args));
 
 async function init() {
   await pool.query(`
@@ -87,11 +91,43 @@ async function init() {
       generated_at BIGINT,
       PRIMARY KEY (user_id, activity_id)
     );
+
+    -- Strava activities mirrored locally so reads never wait on Strava. \`summary\` is the
+    -- raw /athlete/activities item (returned as-is to keep the API shape); \`detail\` is the
+    -- /activities/:id payload, filled lazily the first time a review needs it.
+    CREATE TABLE IF NOT EXISTS activities (
+      user_id TEXT NOT NULL,
+      id BIGINT NOT NULL,
+      name TEXT,
+      type TEXT,
+      sport_type TEXT,
+      start_date TEXT,
+      start_date_local TEXT,
+      local_date TEXT,
+      distance DOUBLE PRECISION,
+      moving_time INTEGER,
+      elapsed_time INTEGER,
+      total_elevation_gain DOUBLE PRECISION,
+      average_speed DOUBLE PRECISION,
+      average_heartrate DOUBLE PRECISION,
+      max_heartrate DOUBLE PRECISION,
+      summary JSONB NOT NULL,
+      detail JSONB,
+      synced_at BIGINT,
+      PRIMARY KEY (user_id, id)
+    );
+    CREATE INDEX IF NOT EXISTS activities_user_start_idx ON activities (user_id, start_date DESC);
+    CREATE INDEX IF NOT EXISTS activities_user_local_idx ON activities (user_id, local_date);
+
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS strava_synced_at BIGINT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS strava_covered_from TEXT;
+    -- Bumped whenever a sync changes stored activities; clients drop persisted caches when it moves
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS activities_version BIGINT;
   `);
 }
 
 // Columns each table accepts for merge/insert (excludes primary-key columns).
-const USER_COLS = ['email', 'name', 'picture', 'google_id', 'strava_athlete_id', 'strava_access_token', 'strava_refresh_token', 'strava_token_expires_at'];
+const USER_COLS = ['email', 'name', 'picture', 'google_id', 'strava_athlete_id', 'strava_access_token', 'strava_refresh_token', 'strava_token_expires_at', 'strava_synced_at', 'strava_covered_from', 'activities_version'];
 const OVERVIEW_COLS = ['distance_km', 'race_date', 'goal_time', 'goal_pace', 'weekly_km', 'days_per_week', 'running_days', 'long_run_day', 'experience', 'training_style', 'notes', 'week_summary', 'plan_summary', 'last_processed_activity_id', 'summaries_checked_date'];
 const REVIEW_COLS = ['activity_name', 'activity_date', 'summary', 'review_text'];
 
@@ -100,6 +136,16 @@ function pick(obj, cols) {
   const out = {};
   for (const c of cols) if (obj[c] !== undefined) out[c] = obj[c];
   return out;
+}
+
+// Unix seconds → Strava's start_date format ("2026-10-01T12:00:00Z", no millis), so the
+// TEXT column compares correctly against it.
+function stravaIso(unixSec) {
+  return new Date(unixSec * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+function activitySignature(a) {
+  return [a.name, a.sport_type, a.distance, a.moving_time, a.start_date].join('|');
 }
 
 // Partial upsert: insert the given columns; on conflict update only those (minus neverUpdate).
@@ -121,6 +167,8 @@ async function upsertRow(table, conflictCols, row, neverUpdate = []) {
 const db = {
   init,
   pool,
+  stravaIso,
+  activitySignature,
 
   users: {
     async findBy(key, value) {
@@ -173,6 +221,14 @@ const db = {
         total_km: wk.total_km,
         workouts: byWeek[wk.week_number] ?? [],
       }));
+    },
+    // Last day of the plan (YYYY-MM-DD), or null when the user has no plan weeks
+    async lastWeekEnd(userId) {
+      const { rows } = await pool.query(
+        'SELECT MAX(week_end) AS week_end FROM training_weeks WHERE user_id = $1',
+        [userId]
+      );
+      return rows[0]?.week_end ?? null;
     },
     async replaceByUserId(userId, weeks) {
       const client = await pool.connect();
@@ -229,6 +285,110 @@ const db = {
     },
     async removeByUserId(userId) {
       await pool.query('DELETE FROM run_reviews WHERE user_id = $1', [userId]);
+    },
+  },
+
+  activities: {
+    // Upsert a batch of Strava summaries; `detail` is left untouched unless the activity
+    // changed on Strava (a rename/edit makes the cached detail stale, so it's cleared).
+    async upsertMany(userId, acts) {
+      if (!acts.length) return;
+      const now = Date.now();
+      const values = [];
+      const rows = acts.map((a, i) => {
+        const base = i * 16;
+        values.push(
+          userId, a.id, a.name ?? null, a.type ?? null, a.sport_type ?? null,
+          a.start_date ?? null, a.start_date_local ?? null,
+          (a.start_date_local || a.start_date || '').slice(0, 10) || null,
+          a.distance ?? null, a.moving_time ?? null, a.elapsed_time ?? null,
+          a.total_elevation_gain ?? null, a.average_speed ?? null,
+          a.average_heartrate ?? null, a.max_heartrate ?? null, JSON.stringify(a),
+        );
+        return `(${Array.from({ length: 16 }, (_, k) => `$${base + k + 1}`).join(', ')}, ${now})`;
+      });
+      await pool.query(
+        `INSERT INTO activities (user_id, id, name, type, sport_type, start_date, start_date_local, local_date,
+           distance, moving_time, elapsed_time, total_elevation_gain, average_speed, average_heartrate, max_heartrate,
+           summary, synced_at)
+         VALUES ${rows.join(', ')}
+         ON CONFLICT (user_id, id) DO UPDATE SET
+           name = EXCLUDED.name, type = EXCLUDED.type, sport_type = EXCLUDED.sport_type,
+           start_date = EXCLUDED.start_date, start_date_local = EXCLUDED.start_date_local, local_date = EXCLUDED.local_date,
+           distance = EXCLUDED.distance, moving_time = EXCLUDED.moving_time, elapsed_time = EXCLUDED.elapsed_time,
+           total_elevation_gain = EXCLUDED.total_elevation_gain, average_speed = EXCLUDED.average_speed,
+           average_heartrate = EXCLUDED.average_heartrate, max_heartrate = EXCLUDED.max_heartrate,
+           -- Keep the cached detail unless the activity itself was edited (kudos etc. don't count)
+           detail = CASE WHEN activities.name IS NOT DISTINCT FROM EXCLUDED.name
+                          AND activities.distance IS NOT DISTINCT FROM EXCLUDED.distance
+                          AND activities.moving_time IS NOT DISTINCT FROM EXCLUDED.moving_time
+                          AND activities.sport_type IS NOT DISTINCT FROM EXCLUDED.sport_type
+                         THEN activities.detail ELSE NULL END,
+           summary = EXCLUDED.summary, synced_at = EXCLUDED.synced_at`,
+        values
+      );
+    },
+    // Newest first, mirroring Strava's /athlete/activities paging. before/after are unix
+    // seconds on start_date (UTC), same semantics as Strava's own params.
+    async list(userId, { before, after, limit = 30, offset = 0 } = {}) {
+      const params = [userId];
+      const where = ['user_id = $1'];
+      if (before) { params.push(stravaIso(before)); where.push(`start_date < $${params.length}`); }
+      if (after) { params.push(stravaIso(after)); where.push(`start_date > $${params.length}`); }
+      params.push(limit, offset);
+      const { rows } = await pool.query(
+        `SELECT summary FROM activities WHERE ${where.join(' AND ')}
+         ORDER BY start_date DESC LIMIT $${params.length - 1} OFFSET $${params.length}`,
+        params
+      );
+      return rows.map(r => r.summary);
+    },
+    // Inclusive local-date range (YYYY-MM-DD), newest first
+    async between(userId, fromDate, toDate) {
+      const { rows } = await pool.query(
+        `SELECT summary FROM activities WHERE user_id = $1 AND local_date >= $2 AND local_date <= $3
+         ORDER BY start_date DESC`,
+        [userId, fromDate, toDate]
+      );
+      return rows.map(r => r.summary);
+    },
+    async latestStartDate(userId) {
+      const { rows } = await pool.query('SELECT MAX(start_date) AS d FROM activities WHERE user_id = $1', [userId]);
+      return rows[0]?.d ?? null;
+    },
+    async oldestStartDate(userId) {
+      const { rows } = await pool.query('SELECT MIN(start_date) AS d FROM activities WHERE user_id = $1', [userId]);
+      return rows[0]?.d ?? null;
+    },
+    // id → fingerprint of the user-editable fields, for spotting edits during a re-sync
+    async signatures(userId, fromIso) {
+      const { rows } = await pool.query(
+        `SELECT id, name, sport_type, distance, moving_time, start_date FROM activities
+         WHERE user_id = $1 AND start_date > $2`, [userId, fromIso]);
+      return new Map(rows.map(r => [r.id, activitySignature(r)]));
+    },
+    async newestId(userId) {
+      const { rows } = await pool.query(
+        'SELECT id FROM activities WHERE user_id = $1 ORDER BY start_date DESC LIMIT 1', [userId]);
+      return rows[0]?.id ?? null;
+    },
+    // Remove activities in a re-fetched window that Strava no longer returns (deleted there)
+    async deleteMissing(userId, fromIso, keepIds) {
+      const { rowCount } = await pool.query(
+        'DELETE FROM activities WHERE user_id = $1 AND start_date > $2 AND NOT (id = ANY($3::bigint[]))',
+        [userId, fromIso, keepIds]
+      );
+      return rowCount;
+    },
+    async getDetail(userId, id) {
+      const { rows } = await pool.query('SELECT detail FROM activities WHERE user_id = $1 AND id = $2', [userId, id]);
+      return rows[0]?.detail ?? null;
+    },
+    async setDetail(userId, id, detail) {
+      await pool.query('UPDATE activities SET detail = $3 WHERE user_id = $1 AND id = $2', [userId, id, JSON.stringify(detail)]);
+    },
+    async removeByUserId(userId) {
+      await pool.query('DELETE FROM activities WHERE user_id = $1', [userId]);
     },
   },
 
