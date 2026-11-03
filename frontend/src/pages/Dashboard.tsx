@@ -1,6 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { api, clearToken, type Activity, type AthleteStats, type RunReview, type User, type Workout } from '../lib/api';
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
+import { api, clearToken, type Activity, type AthleteStats, type Bootstrap, type RunReview, type SyncResult, type TrainingWeek, type User, type Workout } from '../lib/api';
 import { useNavigate } from 'react-router-dom';
+import Splash from '../components/Splash';
+import * as persist from '../lib/persist';
+import { slimActivity } from '../lib/persist';
+import { invalidateInsights } from '../lib/insightsCache';
+
+// Chart code only loads when the Insights tab is opened
+const Insights = lazy(() => import('./Insights'));
 
 interface Props {
   user: User;
@@ -113,7 +120,7 @@ export default function Dashboard({ user, onSignOut }: Props) {
   const [editPace, setEditPace] = useState('');
   const [revisingGoal, setRevisingGoal] = useState(false);
   const [revisingGoalError, setRevisingGoalError] = useState('');
-  const [view, setView] = useState<'overview' | 'calendar'>('overview');
+  const [view, setView] = useState<'overview' | 'calendar' | 'insights'>('overview');
   const [hasPlan, setHasPlan] = useState(false);
   const [uploadedPlan, setUploadedPlan] = useState<File | null>(null);
   const [showPlanModal, setShowPlanModal] = useState(false);
@@ -145,6 +152,16 @@ export default function Dashboard({ user, onSignOut }: Props) {
   const [planSummary, setPlanSummary] = useState<string | null>(null);
   const [summariesPending, setSummariesPending] = useState(false);
   const [planVersion, setPlanVersion] = useState(0);
+  // Bumped when a Strava sync changes stored activities, so views refetch their (cleared) caches
+  const [dataVersion, setDataVersion] = useState(0);
+  const hasPlanRef = useRef(false);
+  const lastSyncAt = useRef(0);
+  // Before any child renders: scope localStorage to this user and hydrate the calendar cache
+  useState(() => {
+    persist.initPersist(user.id);
+    hydrateCalCache();
+    return null;
+  });
   const menuRef = useRef<HTMLDivElement>(null);
   const planInputRef = useRef<HTMLInputElement>(null);
 
@@ -152,9 +169,11 @@ export default function Dashboard({ user, onSignOut }: Props) {
     loadData();
   }, []);
 
-  async function loadData(attempt = 0) {
-    // Plan loading is independent of Strava — load it first so the UI never gets stuck
-    const plan = await api.training.getPlan().catch(() => null);
+  // Apply a bootstrap payload (fresh, or last session's snapshot) to the dashboard
+  function applyBootstrap({ plan, weeks, reviews, recent_activities }: Bootstrap) {
+    seedPlanWeeks(weeks);
+    seedReviews(reviews);
+    hasPlanRef.current = !!plan;
     if (plan) {
       const distKey = Object.keys(RACE_DISTANCES).find(
         k => k !== 'custom' && Math.abs(RACE_DISTANCES[k].km - plan.distance_km) < 0.01
@@ -166,7 +185,6 @@ export default function Dashboard({ user, onSignOut }: Props) {
       setGenPace(plan.goal_pace);
       if (plan.weekly_km != null) setGenWeeklyKm(String(plan.weekly_km));
       if (plan.running_days?.length) setGenRunningDays(plan.running_days);
-      else if (plan.days_per_week != null) { /* legacy: no running_days saved */ }
       if (plan.long_run_day) setGenLongRunDay(plan.long_run_day);
       if (plan.experience) setGenExperience(plan.experience);
       if (plan.training_style) setGenTrainingStyle(plan.training_style);
@@ -174,49 +192,37 @@ export default function Dashboard({ user, onSignOut }: Props) {
       if (plan.week_summary) setWeekSummary(plan.week_summary);
       if (plan.plan_summary) setPlanSummary(plan.plan_summary);
       setPlanCreatedAt(plan.created_at);
-      setHasPlan(true);
 
       const todayKey = dateKey(new Date());
-      const raceDistKm = plan.distance_km;
-      fetchPlanWorkouts()
-        .then(() => {
-          if (!planWeeksCache) return;
-          let km = raceDistKm;
-          for (const week of planWeeksCache) {
-            for (const w of week.workouts) {
-              if (w.date >= todayKey) km += w.km;
-            }
-          }
-          setRemainingKm(km);
-        })
-        .catch(() => {});
+      let km = plan.distance_km;
+      for (const week of weeks) {
+        for (const w of week.workouts) {
+          if (w.date >= todayKey) km += w.km;
+        }
+      }
+      setRemainingKm(km);
+    }
+    setHasPlan(!!plan);
+    setActivities(recent_activities);
+    setLoading(false);
+  }
+
+  async function loadData(attempt = 0) {
+    // Paint the last session's snapshot immediately; the fresh payload replaces it below
+    if (attempt === 0) {
+      const snap = persist.load<Bootstrap>('bootstrap');
+      if (snap) applyBootstrap(snap);
     }
 
-    try {
-      const [acts, st] = await Promise.all([
-        api.training.activities(),
-        api.training.stats(),
-      ]);
-      setActivities(acts);
-      setStats(st);
-      setLoading(false);
+    // Strava sync runs alongside the DB reads; its result is handled once the plan is known
+    const syncing = api.training.sync().catch(() => null);
 
-      // New-run detection: regenerate AI summaries when the newest activity changed, or once per
-      // day regardless (so a missed/unlogged workout still gets acknowledged instead of leaving a
-      // stale "on track" summary). Fire-and-forget — the server skips if nothing needs updating.
-      const newestId = acts[0] ? String(acts[0].id) : null;
-      if (plan && newestId) {
-        setSummariesPending(true);
-        api.training.updateSummaries({ last_activity_id: newestId })
-          .then(r => {
-            if (!r.skipped) {
-              if (r.week_summary) setWeekSummary(r.week_summary);
-              if (r.plan_summary) setPlanSummary(r.plan_summary);
-            }
-          })
-          .catch(() => {})
-          .finally(() => setSummariesPending(false));
-      }
+    try {
+      const boot = await api.training.bootstrap();
+      applyBootstrap(boot);
+      persist.save('bootstrap', { ...boot, recent_activities: boot.recent_activities.map(slimActivity) });
+      // Athlete totals only prefill the Generate-plan form — never block the dashboard on them
+      if (!boot.plan) api.training.stats().then(setStats).catch(() => {});
     } catch (err: any) {
       // Retry once for transient errors, but not for rate limits (429) — retrying makes it worse
       if (attempt === 0 && err.status !== 429) {
@@ -225,8 +231,59 @@ export default function Dashboard({ user, onSignOut }: Props) {
         setError(err.message);
         setLoading(false);
       }
+      return;
+    }
+
+    const result = await syncing;
+    if (result) handleSync(result);
+  }
+
+  // React to a Strava sync. Activities changed (here, or on another device since this
+  // browser's snapshot) → drop the activity caches, refetch, and check the AI summaries.
+  // Nothing changed → nothing to do: summaries only regenerate for a new in-plan activity.
+  function handleSync(result: SyncResult) {
+    lastSyncAt.current = Date.now();
+    const seen = persist.load<number>('version');
+    const dataChanged = result.changed || (seen != null && seen !== result.version);
+    if (dataChanged) {
+      invalidateActivityCaches();
+      setDataVersion(v => v + 1);
+      api.training.activities()
+        .then(acts => {
+          setActivities(acts);
+          const snap = persist.load<Bootstrap>('bootstrap');
+          if (snap) persist.save('bootstrap', { ...snap, recent_activities: acts.map(slimActivity) });
+        })
+        .catch(() => {});
+    }
+    persist.save('version', result.version);
+
+    // The server compares the newest *in-plan* run with the one it last summarised and
+    // skips otherwise — so a run logged after a finished plan doesn't regenerate anything
+    if (dataChanged && hasPlanRef.current) {
+      setSummariesPending(true);
+      api.training.updateSummaries()
+        .then(r => {
+          if (!r.skipped) {
+            if (r.week_summary) setWeekSummary(r.week_summary);
+            if (r.plan_summary) setPlanSummary(r.plan_summary);
+          }
+        })
+        .catch(() => {})
+        .finally(() => setSummariesPending(false));
     }
   }
+
+  // Coming back to the tab (e.g. after recording a run): sync again, at most every 30s
+  useEffect(() => {
+    function onVisible() {
+      if (document.visibilityState !== 'visible' || Date.now() - lastSyncAt.current < 30_000) return;
+      lastSyncAt.current = Date.now();
+      api.training.sync().then(handleSync).catch(() => {});
+    }
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
+  }, []);
 
   // Close menu when clicking outside
   useEffect(() => {
@@ -240,6 +297,7 @@ export default function Dashboard({ user, onSignOut }: Props) {
   }, []);
 
   function signOut() {
+    clearClientCaches();
     clearToken();
     onSignOut();
     navigate('/login');
@@ -247,6 +305,7 @@ export default function Dashboard({ user, onSignOut }: Props) {
 
   function disconnectAndSignOut() {
     api.auth.disconnectStrava().finally(() => {
+      clearClientCaches();
       clearToken();
       onSignOut();
       navigate('/login');
@@ -255,6 +314,7 @@ export default function Dashboard({ user, onSignOut }: Props) {
 
   function deleteAccount() {
     api.auth.deleteAccount().finally(() => {
+      clearClientCaches();
       clearToken();
       onSignOut();
       navigate('/login');
@@ -266,7 +326,9 @@ export default function Dashboard({ user, onSignOut }: Props) {
     const [y, m, d] = genDate.split('-').map(Number);
     return Math.max(0, Math.ceil((new Date(y, m - 1, d).getTime() - Date.now()) / (7 * 24 * 60 * 60 * 1000)));
   })();
-  const planBadgeText = weeksLeft !== null
+  const planBadgeText = !loading && planEnded()
+    ? 'Plan complete'
+    : weeksLeft !== null
     ? `${weeksLeft} week${weeksLeft === 1 ? '' : 's'} left${remainingKm !== null ? ` · ${Math.round(remainingKm)} km` : ''}`
     : '';
 
@@ -288,6 +350,10 @@ export default function Dashboard({ user, onSignOut }: Props) {
                   style={{ ...styles.navLink, ...(view === 'calendar' ? styles.navLinkActive : {}) }}
                   onClick={() => setView('calendar')}
                 >Calendar</button>
+                <button
+                  style={{ ...styles.navLink, ...(view === 'insights' ? styles.navLinkActive : {}) }}
+                  onClick={() => setView('insights')}
+                >Insights</button>
               </nav>
             )}
           </div>
@@ -360,6 +426,10 @@ export default function Dashboard({ user, onSignOut }: Props) {
                 style={{ ...styles.navLink, ...(view === 'calendar' ? styles.navLinkActive : {}) }}
                 onClick={() => setView('calendar')}
               >Calendar</button>
+              <button
+                style={{ ...styles.navLink, ...(view === 'insights' ? styles.navLinkActive : {}) }}
+                onClick={() => setView('insights')}
+              >Insights</button>
             </nav>
             <span style={styles.navMeta}>{planBadgeText}</span>
           </div>
@@ -367,7 +437,7 @@ export default function Dashboard({ user, onSignOut }: Props) {
       </header>
 
       <main style={{ ...styles.main, maxWidth: 'none' }} className="main-content">
-        {loading && <p style={styles.muted}>Loading your training data…</p>}
+        {loading && <Splash message="Loading your training data…" />}
         {error && <p style={{ color: '#F87171' }}>{error}</p>}
 
         {!loading && !hasPlan && (
@@ -396,7 +466,7 @@ export default function Dashboard({ user, onSignOut }: Props) {
         {!loading && hasPlan && view === 'overview' && (
           <div style={ovStyles.grid} className="ov-grid">
             <div style={ovStyles.leftCol} className="ov-left-col">
-              <ThisWeek key={planVersion} activities={activities} />
+              <ThisWeek key={planVersion} activities={activities} dataVersion={dataVersion} />
               <PlanProgress
                 raceDate={genDate}
                 goalTime={genTime}
@@ -414,7 +484,13 @@ export default function Dashboard({ user, onSignOut }: Props) {
         )}
 
         {!loading && hasPlan && view === 'calendar' && (
-          <CalendarView key={planVersion} />
+          <CalendarView key={planVersion} dataVersion={dataVersion} />
+        )}
+
+        {!loading && hasPlan && view === 'insights' && (
+          <Suspense fallback={<Splash message="Loading insights…" />}>
+            <Insights planVersion={planVersion} dataVersion={dataVersion} />
+          </Suspense>
         )}
       </main>
 
@@ -450,9 +526,7 @@ export default function Dashboard({ user, onSignOut }: Props) {
                 setRemainingKm(null);
                 setWeekSummary(null);
                 setPlanSummary(null);
-                planCache = null;
-                planWeeksCache = null;
-                planInflight = null;
+                resetPlanCaches();
                 setPlanVersion(v => v + 1);
               }}>
                 Recreate plan
@@ -529,9 +603,7 @@ export default function Dashboard({ user, onSignOut }: Props) {
                       await api.training.reviseGoal(editTime);
                       setGenTime(editTime);
                       setGenPace(editPace);
-                      planCache = null;
-                      planWeeksCache = null;
-                      planInflight = null;
+                      resetPlanCaches();
                       setPlanVersion(v => v + 1);
                       setEditGoalOpen(false);
                       loadData();
@@ -730,9 +802,7 @@ export default function Dashboard({ user, onSignOut }: Props) {
                         goal_time: upTime,
                         goal_pace: upPace,
                       });
-                      planCache = null;
-                      planWeeksCache = null;
-                      planInflight = null;
+                      resetPlanCaches();
                       setPlanVersion(v => v + 1);
                       closeModal();
                       setHasPlan(true);
@@ -1007,9 +1077,7 @@ export default function Dashboard({ user, onSignOut }: Props) {
                         notes: genNotes || undefined,
                       });
                       await api.training.generatePlan();
-                      planCache = null;
-                      planWeeksCache = null;
-                      planInflight = null;
+                      resetPlanCaches();
                       setPlanVersion(v => v + 1);
                       setPlanCreatedAt(Date.now());
                       setShowGenModal(false);
@@ -1065,8 +1133,28 @@ export default function Dashboard({ user, onSignOut }: Props) {
 
 const DAY_NAMES = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
+// Last day of the plan (YYYY-MM-DD), once the plan weeks have loaded
+function planEndKey(): string | null {
+  if (!planWeeksCache?.length) return null;
+  return planWeeksCache.reduce((end, w) => (w.week_end > end ? w.week_end : end), '');
+}
+
+function planEnded(): boolean {
+  const end = planEndKey();
+  return end !== null && dateKey(new Date()) > end;
+}
+
+// "Now" for the dashboard: today, or the plan's last day once the plan is over,
+// so the overview and calendar stay on the final week instead of drifting past it.
+function planAnchorDate(): Date {
+  const end = planEndKey();
+  if (end === null || !planEnded()) return new Date();
+  const [y, m, d] = end.split('-').map(Number);
+  return new Date(y, m - 1, d);
+}
+
 function getMondayOfWeek(offset: number): Date {
-  const today = new Date();
+  const today = planAnchorDate();
   const dow = today.getDay();
   const monday = new Date(today);
   monday.setDate(today.getDate() - ((dow + 6) % 7) + offset * 7);
@@ -1074,7 +1162,7 @@ function getMondayOfWeek(offset: number): Date {
   return monday;
 }
 
-function ThisWeek({ activities }: { activities: Activity[] }) {
+function ThisWeek({ activities, dataVersion }: { activities: Activity[]; dataVersion: number }) {
   const [offset, setOffset] = useState(0);
   const [planByDate, setPlanByDate] = useState<Record<string, Workout>>(planCache ?? {});
   const [weekActivities, setWeekActivities] = useState<Activity[]>(activities);
@@ -1116,7 +1204,7 @@ function ThisWeek({ activities }: { activities: Activity[] }) {
       .catch(() => {});
 
     return () => { cancelled = true; };
-  }, [offset]);
+  }, [offset, dataVersion]);
 
   const activityDates = useMemo(() => {
     const set = new Set<string>();
@@ -1155,7 +1243,7 @@ function ThisWeek({ activities }: { activities: Activity[] }) {
       <div style={ovStyles.weekHeader}>
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
           <p style={{ ...ovStyles.cardTitle, margin: 0 }}>
-            {offset < 0 ? 'Past Week' : offset > 0 ? 'Future Week' : 'This Week'}
+            {offset < 0 ? 'Past Week' : offset > 0 ? 'Future Week' : planEnded() ? 'Final Week' : 'This Week'}
           </p>
           {planWeek && (
             <span style={ovStyles.weekNumBadge}>
@@ -1171,7 +1259,7 @@ function ThisWeek({ activities }: { activities: Activity[] }) {
             style={{ ...ovStyles.currentWeekBtn, visibility: isCurrentWeek ? 'hidden' : 'visible' }}
             className="current-week-btn"
             onClick={() => setOffset(0)}
-          >Current week</button>
+          >{planEnded() ? 'Final week' : 'Current week'}</button>
         </div>
       </div>
       <div style={ovStyles.weekList}>
@@ -1213,7 +1301,7 @@ function ThisWeek({ activities }: { activities: Activity[] }) {
         ))}
       </div>
       {(() => {
-        const totalKm = weekDays.reduce((sum, d) => sum + (d.workout?.km ?? 0), 0);
+        const totalKm = roundKm(weekDays.reduce((sum, d) => sum + (d.workout?.km ?? 0), 0));
         return totalKm > 0 ? (
           <div style={ovStyles.weekTotal}>
             <div style={{ width: 48, flexShrink: 0 }} />
@@ -1242,7 +1330,8 @@ interface PlanProgressProps {
 }
 
 function PlanProgress({ raceDate, goalTime, distanceKey, customKm, createdAt, activities, weekSummary, planSummary, summariesPending }: PlanProgressProps) {
-  const [tab, setTab] = useState<'week' | 'plan'>('week');
+  // A finished plan opens on the overall view — the final week is old news by then
+  const [tab, setTab] = useState<'week' | 'plan'>(() => (planEnded() ? 'plan' : 'week'));
 
   const raceDateMs = (() => {
     if (!raceDate) return null;
@@ -1261,7 +1350,7 @@ function PlanProgress({ raceDate, goalTime, distanceKey, customKm, createdAt, ac
       ? Math.max(1, Math.round((raceDateMs - createdAt) / (7 * 24 * 3600 * 1000)))
       : null);
   const doneWeeks = planWeeksCache
-    ? planWeeksCache.filter(w => w.week_start < mondayKey).length
+    ? (planEnded() ? planWeeksCache.length : planWeeksCache.filter(w => w.week_start < mondayKey).length)
     : ((createdAt && totalWeeks !== null)
       ? Math.min(totalWeeks, Math.max(0, Math.round((now - createdAt) / (7 * 24 * 3600 * 1000))))
       : null);
@@ -1281,8 +1370,9 @@ function PlanProgress({ raceDate, goalTime, distanceKey, customKm, createdAt, ac
 
   // This week from the plan
   const sundayKey = (() => { const s = new Date(monday); s.setDate(monday.getDate() + 6); return dateKey(s); })();
+  // Rounded to 0.1 km — summing decimal distances leaves float noise like 8.200000000000003
   const weekTarget = planWeeksCache
-    ? (planWeeksCache.find(w => w.week_start === mondayKey)?.workouts.reduce((s, wk) => s + wk.km, 0) ?? 0)
+    ? roundKm(planWeeksCache.find(w => w.week_start === mondayKey)?.workouts.reduce((s, wk) => s + wk.km, 0) ?? 0)
     : null;
   // Actual km run this week from Strava activities
   const weekDone = Math.round(
@@ -1308,7 +1398,7 @@ function PlanProgress({ raceDate, goalTime, distanceKey, customKm, createdAt, ac
           <button
             style={{ ...ovStyles.progressTab, ...(tab === 'week' ? ovStyles.progressTabActive : {}) }}
             onClick={() => setTab('week')}
-          >This Week</button>
+          >{planEnded() ? 'Final Week' : 'This Week'}</button>
           <button
             style={{ ...ovStyles.progressTab, ...(tab === 'plan' ? ovStyles.progressTabActive : {}) }}
             onClick={() => setTab('plan')}
@@ -1331,7 +1421,7 @@ function PlanProgress({ raceDate, goalTime, distanceKey, customKm, createdAt, ac
             <div style={{ ...ovStyles.progressFill, width: `${Math.min(weekPct, 100)}%` }} />
           </div>
           <div style={ovStyles.progressSub}>
-            {weekTarget !== null ? `${Math.max(0, weekTarget - weekDone)} km to go this week` : ''}
+            {weekTarget !== null ? `${roundKm(Math.max(0, weekTarget - weekDone))} km to go this week` : ''}
           </div>
           {summariesPending
             ? <p style={{ ...ovStyles.aiSummary, fontStyle: 'italic', opacity: 0.6 }}>Generating your training summary…</p>
@@ -1352,7 +1442,9 @@ function PlanProgress({ raceDate, goalTime, distanceKey, customKm, createdAt, ac
           </div>
           <div style={ovStyles.progressSub}>
             {plannedDoneKm !== null && totalKm !== null
-              ? `${Math.round(plannedDoneKm)} km done · ${Math.round(totalKm - plannedDoneKm)} km remaining`
+              ? (planEnded()
+                ? `${Math.round(plannedDoneKm)} km done · plan complete`
+                : `${Math.round(plannedDoneKm)} km done · ${Math.round(totalKm - plannedDoneKm)} km remaining`)
               : 'loading…'}
           </div>
           {summariesPending
@@ -1434,8 +1526,8 @@ function ReviewText({ text, skipHeading = false }: { text: string; skipHeading?:
 }
 
 function RecentActivities({ activities: initialActivities }: { activities: Activity[] }) {
-  const [reviews, setReviews] = useState<Record<string, RunReview>>({});
-  const [reviewsLoaded, setReviewsLoaded] = useState(false);
+  const [reviews, setReviews] = useState<Record<string, RunReview>>(() => reviewsSeed ?? {});
+  const [reviewsLoaded, setReviewsLoaded] = useState(reviewsSeed !== null);
   const [generating, setGenerating] = useState<Set<string>>(new Set());
   const [manualFailed, setManualFailed] = useState<Set<string>>(new Set());
   const [planRange, setPlanRange] = useState<{ start: string; end: string } | null>(null);
@@ -1789,11 +1881,15 @@ function fetchCalMonth(d: Date): Promise<Activity[]> {
     calCache[key] = [];
     return Promise.resolve([]);
   }
+  // Nothing after a finished plan is ever pulled from Strava (not cached: a new plan reopens it)
+  const end = planEndKey();
+  if (end !== null && dateKey(monthStart) > end) return Promise.resolve([]);
   const after = Math.floor(monthStart.getTime() / 1000);
   const before = Math.floor(new Date(year, month + 1, 1).getTime() / 1000);
   const promise = api.training.activities({ after, before, per_page: 100 })
     .then(acts => {
       calCache[key] = acts;
+      persistCalCache();
       delete calInflight[key];
       delete calFailed[key];
       delete calFailedBackoff[key];
@@ -1819,14 +1915,69 @@ function fetchPlanWorkouts(): Promise<Record<string, Workout>> {
   if (planCache) return Promise.resolve(planCache);
   if (planInflight) return planInflight;
   planInflight = api.training.weeks().then(weeks => {
-    planWeeksCache = weeks;
-    const map: Record<string, Workout> = {};
-    for (const w of weeks) for (const wk of w.workouts) map[wk.date] = wk;
-    planCache = map;
     planInflight = null;
-    return map;
+    return seedPlanWeeks(weeks);
   }).catch(err => { planInflight = null; throw err; });
   return planInflight;
+}
+
+function seedPlanWeeks(weeks: TrainingWeek[]): Record<string, Workout> {
+  planWeeksCache = weeks;
+  const map: Record<string, Workout> = {};
+  for (const w of weeks) for (const wk of w.workouts) map[wk.date] = wk;
+  planCache = map;
+  return map;
+}
+
+function resetPlanCaches() {
+  planCache = null;
+  planWeeksCache = null;
+  planInflight = null;
+  persist.remove('bootstrap');
+  invalidateInsights();
+}
+
+// ── Client cache lifecycle ───────────────────────────────────────────────────
+
+// Calendar months survive reloads; a sync that changes activities clears them all
+function hydrateCalCache() {
+  Object.assign(calCache, persist.load<Record<string, Activity[]>>('cal') ?? {});
+}
+
+function persistCalCache() {
+  const slim: Record<string, Activity[]> = {};
+  for (const [k, acts] of Object.entries(calCache)) slim[k] = acts.map(slimActivity);
+  persist.save('cal', slim);
+}
+
+function invalidateActivityCaches() {
+  for (const k of Object.keys(calCache)) delete calCache[k];
+  persist.remove('cal');
+  invalidateInsights();
+}
+
+// Reviews from the bootstrap payload, so RecentActivities can show them on first paint
+let reviewsSeed: Record<string, RunReview> | null = null;
+
+function seedReviews(list: RunReview[]) {
+  reviewsSeed = {};
+  for (const r of list) {
+    reviewsSeed[r.activity_id] = r;
+    reviewDone.add(r.activity_id);
+  }
+}
+
+// Sign-out / disconnect / delete: nothing from this user may leak into the next session
+function clearClientCaches() {
+  resetPlanCaches();
+  invalidateActivityCaches();
+  reviewsSeed = null;
+  reviewDone.clear();
+  persist.clearAll();
+}
+
+function roundKm(km: number) {
+  return Math.round(km * 10) / 10;
 }
 
 function dateKey(d: Date) {
@@ -1911,11 +2062,35 @@ function generateICS(weeks: import('../lib/api').TrainingWeek[]): string {
   return lines.join('\r\n');
 }
 
-function CalendarView() {
-  const todayStart = (() => { const n = new Date(); return new Date(n.getFullYear(), n.getMonth(), 1); })();
+function CalendarView({ dataVersion }: { dataVersion: number }) {
+  const todayStart = (() => { const n = planAnchorDate(); return new Date(n.getFullYear(), n.getMonth(), 1); })();
   const [current, setCurrent] = useState(todayStart);
   const [selectedActivity, setSelectedActivity] = useState<Activity | null>(null);
   const [selectedWorkout, setSelectedWorkout] = useState<Workout | null>(null);
+  const detailRef = useRef<HTMLDivElement>(null);
+
+  // The detail panel sits below the grid, so scroll it to the top when a day is picked.
+  // It opens short and grows once the AI review loads (or shrinks while the next one
+  // reloads), which clamps a one-off scroll short — so keep re-aligning as it resizes,
+  // until it settles or the user scrolls themselves.
+  useEffect(() => {
+    const el = detailRef.current;
+    if (!el || (!selectedActivity && !selectedWorkout)) return;
+    let following = true;
+    const align = () => { if (following) el.scrollIntoView({ behavior: 'smooth', block: 'start' }); };
+    const stop = () => { following = false; };
+    const ro = new ResizeObserver(align); // also fires once on observe
+    ro.observe(el);
+    window.addEventListener('wheel', stop, { passive: true });
+    window.addEventListener('touchmove', stop, { passive: true });
+    const timer = setTimeout(stop, 4000);
+    return () => {
+      ro.disconnect();
+      clearTimeout(timer);
+      window.removeEventListener('wheel', stop);
+      window.removeEventListener('touchmove', stop);
+    };
+  }, [selectedActivity, selectedWorkout]);
   const [monthActivities, setMonthActivities] = useState<Activity[]>([]);
   const [prevActivities, setPrevActivities] = useState<Activity[]>([]);
   const [nextActivities, setNextActivities] = useState<Activity[]>([]);
@@ -1926,8 +2101,9 @@ function CalendarView() {
   const [showExportModal, setShowExportModal] = useState(false);
   const [monthLoading, setMonthLoading] = useState(false);
 
+  useEffect(() => { setSelectedActivity(null); }, [current]);
+
   useEffect(() => {
-    setSelectedActivity(null);
     let cancelled = false;
 
     const prev = new Date(current.getFullYear(), current.getMonth() - 1, 1);
@@ -1962,7 +2138,7 @@ function CalendarView() {
     fetchCalMonth(new Date(current.getFullYear(), current.getMonth() + 2, 1)).catch(() => {});
     fetchCalMonth(todayStart).catch(() => {});
     return () => { cancelled = true; };
-  }, [current]);
+  }, [current, dataVersion]);
 
   const activitiesByDate = useMemo(() => {
     const seen = new Set<number>();
@@ -2021,13 +2197,13 @@ function CalendarView() {
 
   return (
     <>
-    <div>
+    <div style={calStyles.wrapScroll}>
       <div style={calStyles.header} className="cal-header">
         <button style={calStyles.navBtn} onClick={prev}>&#8249;</button>
         <span style={calStyles.monthLabel} className="cal-month-label">{monthLabel}</span>
         <button style={calStyles.navBtn} onClick={next}>&#8250;</button>
         {!isCurrentMonth && (
-          <button style={calStyles.todayBtn} onClick={() => setCurrent(todayStart)}>Today</button>
+          <button style={calStyles.todayBtn} onClick={() => setCurrent(todayStart)}>{planEnded() ? 'Final week' : 'Today'}</button>
         )}
         {monthLoading && <span style={{ fontSize: 12, color: 'var(--text-muted)', marginLeft: 4 }}>Loading…</span>}
         {monthLoadFailed && !monthLoading && (
@@ -2054,8 +2230,8 @@ function CalendarView() {
         </button>
       </div>
 
-      <div style={{ display: 'flex', gap: 20, alignItems: 'flex-start' }} className="cal-layout">
-        <div style={{ flex: 1, minWidth: 0 }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }} className="cal-layout">
+        <div style={{ minWidth: 0 }}>
           <div style={calStyles.grid}>
             {['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].map(d => (
               <div key={d} style={calStyles.dayHeader} className="cal-cell">
@@ -2157,12 +2333,14 @@ function CalendarView() {
           </div>
         </div>
 
-        {selectedWorkout && (
-          <WorkoutDetail workout={selectedWorkout} onClose={() => setSelectedWorkout(null)} />
-        )}
-        {selectedActivity && !selectedWorkout && (
-          <ActivityDetail activity={selectedActivity} onClose={() => setSelectedActivity(null)} />
-        )}
+        <div ref={detailRef}>
+          {selectedWorkout && (
+            <WorkoutDetail workout={selectedWorkout} onClose={() => setSelectedWorkout(null)} />
+          )}
+          {selectedActivity && !selectedWorkout && (
+            <ActivityDetail activity={selectedActivity} onClose={() => setSelectedActivity(null)} />
+          )}
+        </div>
       </div>
     </div>
 
@@ -2230,7 +2408,7 @@ function WorkoutDetail({ workout, onClose }: { workout: Workout; onClose: () => 
           <span style={calStyles.detailLabel}>Distance</span>
           <span style={calStyles.detailValue}>{workout.km} km</span>
         </div>
-        <div style={{ ...calStyles.detailRow, flexDirection: 'column', alignItems: 'flex-start', gap: 4 }}>
+        <div style={{ ...calStyles.detailRow, gridColumn: '1 / -1', gap: 4 }}>
           <span style={calStyles.detailLabel}>Instructions</span>
           <span style={{ ...calStyles.detailValue, fontSize: 13, lineHeight: 1.5, color: 'var(--text-muted)' }}>{workout.description}</span>
         </div>
@@ -2239,21 +2417,39 @@ function WorkoutDetail({ workout, onClose }: { workout: Workout; onClose: () => 
   );
 }
 
-function ActivityDetail({ activity: run, onClose }: { activity: Activity; onClose: () => void }) {
-  const [review, setReview] = useState<RunReview | null>(null);
+function ActivityDetail({ activity, onClose }: { activity: Activity; onClose: () => void }) {
+  // What's on screen. Switching runs keeps the previous run + review up until the new
+  // review has loaded, then swaps both at once — clearing first collapses the panel and
+  // makes the calendar jump up and back down.
+  const [shown, setShown] = useState<{ run: Activity; review: RunReview | null }>({ run: activity, review: null });
   const [genState, setGenState] = useState<'idle' | 'generating' | 'error'>('idle');
+  const run = shown.run;
+  const review = shown.review;
+  const shownIdRef = useRef(run.id);
+  shownIdRef.current = run.id;
 
   useEffect(() => {
-    setReview(null);
-    setGenState('idle');
-    api.training.getReview(run.id).then(setReview).catch(() => {});
-  }, [run.id]);
+    let cancelled = false;
+    const show = (r: RunReview | null) => {
+      if (cancelled) return;
+      setShown({ run: activity, review: r });
+      setGenState('idle');
+    };
+    api.training.getReview(activity.id).then(show).catch(() => show(null));
+    return () => { cancelled = true; };
+  }, [activity.id]);
 
   function generateReview() {
+    const target = run;
     setGenState('generating');
-    api.training.generateReview(run.id)
-      .then(r => { setReview(r.review); setGenState('idle'); })
-      .catch(() => setGenState('error'));
+    api.training.generateReview(target.id)
+      .then(r => {
+        // Ignore a late result if the user has since moved to another run
+        if (shownIdRef.current !== target.id) return;
+        setShown({ run: target, review: r.review });
+        setGenState('idle');
+      })
+      .catch(() => { if (shownIdRef.current === target.id) setGenState('error'); });
   }
 
   const date = new Date(run.start_date).toLocaleDateString('en-US', {
@@ -2310,6 +2506,7 @@ function ActivityDetail({ activity: run, onClose }: { activity: Activity; onClos
 
 const calStyles: Record<string, React.CSSProperties> = {
   wrap: { marginTop: 8 },
+  wrapScroll: { flex: 1, minHeight: 0, overflowY: 'auto', paddingRight: 4, paddingBottom: 16 },
   header: { display: 'flex', alignItems: 'center', gap: 16, marginBottom: 20 },
   monthLabel: { fontSize: 18, fontWeight: 700, color: 'var(--text)', minWidth: 200, textAlign: 'center' },
   navBtn: {
@@ -2388,7 +2585,7 @@ const calStyles: Record<string, React.CSSProperties> = {
     overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
   },
   detailPanel: {
-    width: 280, flexShrink: 0,
+    width: '100%',
     background: 'var(--surface)', border: '1px solid var(--border)',
     borderRadius: 12, padding: '20px',
     display: 'flex', flexDirection: 'column', gap: 20,
@@ -2401,8 +2598,9 @@ const calStyles: Record<string, React.CSSProperties> = {
     borderRadius: 6, width: 28, height: 28, cursor: 'pointer', fontSize: 12,
     display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
   },
-  detailStats: { display: 'flex', flexDirection: 'column', gap: 12 },
-  detailRow: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' },
+  // Full-width panel below the grid: stats wrap as a strip instead of stretched label…value rows
+  detailStats: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(120px, 1fr))', gap: '12px 24px' },
+  detailRow: { display: 'flex', flexDirection: 'column', gap: 2 },
   detailLabel: { fontSize: 13, color: 'var(--text-muted)' },
   detailValue: { fontSize: 15, fontWeight: 700, color: 'var(--text)' },
   planPill: {

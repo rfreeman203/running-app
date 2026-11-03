@@ -110,6 +110,47 @@ export interface AthleteStats {
   all_run_totals: { count: number; distance: number; moving_time: number };
 }
 
+export interface InsightsRun {
+  id: string;
+  date: string;
+  name: string;
+  km: number;
+  moving_time: number;
+  pace_sec: number | null;
+  avg_hr: number | null;
+  max_hr: number | null;
+  elevation_m: number;
+  planned_type: string | null;
+}
+
+export interface Insights {
+  today: string;
+  plan_start: string;
+  plan_end: string;
+  total_weeks: number;
+  workouts: { done: number; made_up: number; missed: number; left: number };
+  by_type: { type: string; due: number; completed: number }[];
+  weekly: { week_number: number; week_start: string; phase: string; planned_km: number; actual_km: number | null; runs: number | null }[];
+  runs: InsightsRun[];
+  max_hr: number;
+  max_hr_source: 'observed' | 'default';
+  zones: { zone: number; name: string; min_bpm: number | null; max_bpm: number | null; seconds: number; runs: number }[];
+}
+
+export interface Bootstrap {
+  plan: MarathonPlan | null;
+  weeks: TrainingWeek[];
+  reviews: RunReview[];
+  recent_activities: Activity[];
+}
+
+export interface SyncResult {
+  ok: boolean;
+  changed: boolean;
+  version: number;
+  newest_id: string | null;
+}
+
 export const api = {
   auth: {
     googleSignIn: (credential: string) =>
@@ -128,7 +169,10 @@ export const api = {
       if (params.after) q.set('after', String(params.after));
       return request<Activity[]>(`/training/activities?${q}`);
     },
+    bootstrap: () => request<Bootstrap>('/training/bootstrap'),
+    sync: () => request<SyncResult>('/training/sync', { method: 'POST' }),
     stats: () => request<AthleteStats>('/training/stats'),
+    insights: () => request<Insights>('/training/insights'),
     getPlan: () => request<MarathonPlan>('/training/plan'),
     savePlan: (body: { distance_km: number; race_date: string; goal_time: string; goal_pace: string; weekly_km?: number; days_per_week?: number; running_days?: string[]; long_run_day?: string; experience?: string; training_style?: string; notes?: string }) =>
       request<{ ok: boolean }>('/training/plan', { method: 'POST', body: JSON.stringify(body) }),
@@ -151,7 +195,7 @@ export const api = {
       request<{ ok: boolean; cached?: boolean; review: RunReview }>(
         `/training/review/${activityId}/generate${opts.refresh ? '?refresh=1' : ''}`,
         { method: 'POST' }),
-    updateSummaries: (body: { initial?: boolean; last_activity_id?: string | number; force?: boolean } = {}) =>
+    updateSummaries: (body: { initial?: boolean; force?: boolean } = {}) =>
       request<{ ok: boolean; skipped?: boolean; week_summary?: string; plan_summary?: string }>(
         '/training/update-summaries', { method: 'POST', body: JSON.stringify(body) }),
   },

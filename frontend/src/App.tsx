@@ -5,6 +5,7 @@ import Login from './pages/Login';
 import ConnectStrava from './pages/ConnectStrava';
 import Dashboard from './pages/Dashboard';
 import StravaCallback from './pages/StravaCallback';
+import Splash from './components/Splash';
 
 function AuthGuard({ user, children }: { user: User | null; children: React.ReactNode }) {
   if (!user) return <Navigate to="/login" replace />;
@@ -36,7 +37,7 @@ export default function App() {
     return () => { cancelled = true; };
   }, []);
 
-  if (user === undefined) return <Splash />;
+  if (user === undefined) return <Splash fullScreen />;
 
   return (
     <BrowserRouter>
@@ -58,8 +59,3 @@ export default function App() {
   );
 }
 
-function Splash() {
-  return (
-    <div style={{ height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center' }} />
-  );
-}
