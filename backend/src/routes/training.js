@@ -646,122 +646,20 @@ const DEFAULT_MAX_HR = 190;
 
 // Plan-vs-actual stats for the Insights page: workout completion, weekly mileage,
 // heart rate and time-in-zone. All derived from the plan + Strava summaries, no AI.
+// `?plan=<id>` computes the same for a past plan (also used for comparisons).
 router.get('/insights', requireAuth, async (req, res) => {
   try {
-    const weeks = (await db.training_weeks.findByUserId(req.userId))
-      .slice()
-      .sort((a, b) => a.week_start.localeCompare(b.week_start));
-    if (!weeks.length) return res.status(404).json({ error: 'No plan found' });
-
-    const today = clientToday(req);
-    const planStart = weeks[0].week_start;
-    const planEnd = weeks[weeks.length - 1].week_end;
-    const rangeEnd = today < planEnd ? today : planEnd;
-
-    await ensureBackfilled(req.userId);
-    const activities = today < planStart ? [] : await db.activities.between(req.userId, planStart, rangeEnd);
-    const activityDates = new Set(activities.map(activityLocalDate));
-    const runs = activities.filter(isRunType);
-
-    // ── Workout completion ──
-    const workoutStatus = { done: 0, made_up: 0, missed: 0, left: 0 };
-    const byType = {};
-    const weekly = [];
-    for (const week of weeks) {
-      const workouts = week.workouts ?? [];
-      const done = [];
-      const missed = [];
-      for (const w of workouts) {
-        if (activityDates.has(w.date)) done.push(w);
-        else if (w.date < today) missed.push(w);
-        else workoutStatus.left++;
-      }
-
-      const inWeek = r => {
-        const d = activityLocalDate(r);
-        return d >= week.week_start && d <= week.week_end;
-      };
-      const weekRuns = runs.filter(inWeek);
-      const pairs = matchMakeupRuns(
-        missed,
-        weekRuns.map(r => ({ date: activityLocalDate(r), name: r.name, km: +((r.distance || 0) / 1000).toFixed(2) })),
-        new Set(workouts.map(w => w.date)),
-      );
-      const madeUpDates = new Set(pairs.map(p => p.missed.date));
-      workoutStatus.done += done.length;
-      workoutStatus.made_up += pairs.length;
-      workoutStatus.missed += missed.length - pairs.length;
-
-      for (const w of workouts) {
-        if (w.date >= today && !activityDates.has(w.date)) continue; // not due yet
-        const t = (byType[w.type] ??= { type: w.type, due: 0, completed: 0 });
-        t.due++;
-        if (activityDates.has(w.date) || madeUpDates.has(w.date)) t.completed++;
-      }
-
-      const started = week.week_start <= today;
-      weekly.push({
-        week_number: week.week_number,
-        week_start: week.week_start,
-        phase: week.phase,
-        planned_km: +workouts.reduce((s, w) => s + (w.km || 0), 0).toFixed(1),
-        actual_km: started ? +(weekRuns.reduce((s, r) => s + (r.distance || 0), 0) / 1000).toFixed(1) : null,
-        runs: started ? weekRuns.length : null,
-      });
+    let weeks;
+    if (req.query.plan) {
+      const past = await db.past_plans.find(req.userId, Number(req.query.plan));
+      if (!past) return res.status(404).json({ error: 'Plan not found' });
+      weeks = past.weeks;
+    } else {
+      weeks = await db.training_weeks.findByUserId(req.userId);
     }
-
-    // ── Heart rate & zones ──
-    // Max HR isn't in the activity summaries' athlete scope, so take the highest seen
-    // in-plan — a reasonable proxy once a few hard sessions are logged.
-    const observedMax = Math.max(0, ...runs.map(r => r.max_heartrate || 0));
-    const maxHr = observedMax >= 150 ? Math.round(observedMax) : DEFAULT_MAX_HR;
-    const zones = HR_ZONES.map((z, i) => ({
-      zone: z.zone,
-      name: z.name,
-      min_bpm: i === 0 ? null : Math.round(HR_ZONES[i - 1].max * maxHr),
-      max_bpm: Number.isFinite(z.max) ? Math.round(z.max * maxHr) : null,
-      seconds: 0,
-      runs: 0,
-    }));
-
-    const plannedTypeByDate = new Map(weeks.flatMap(w => w.workouts ?? []).map(w => [w.date, w.type]));
-    const runRows = runs
-      .map(r => {
-        const row = {
-          id: String(r.id),
-          date: activityLocalDate(r),
-          name: r.name,
-          km: +((r.distance || 0) / 1000).toFixed(2),
-          moving_time: r.moving_time || 0,
-          pace_sec: r.distance > 0 ? Math.round(r.moving_time / (r.distance / 1000)) : null,
-          avg_hr: r.average_heartrate ? Math.round(r.average_heartrate) : null,
-          max_hr: r.max_heartrate ? Math.round(r.max_heartrate) : null,
-          elevation_m: r.total_elevation_gain ?? 0,
-          planned_type: plannedTypeByDate.get(activityLocalDate(r)) ?? null,
-        };
-        if (row.avg_hr) {
-          const pct = row.avg_hr / maxHr;
-          const z = zones[HR_ZONES.findIndex(hz => pct < hz.max)];
-          z.seconds += row.moving_time;
-          z.runs++;
-        }
-        return row;
-      })
-      .sort((a, b) => a.date.localeCompare(b.date));
-
-    res.json({
-      today,
-      plan_start: planStart,
-      plan_end: planEnd,
-      total_weeks: weeks.length,
-      workouts: workoutStatus,
-      by_type: Object.values(byType),
-      weekly,
-      runs: runRows,
-      max_hr: maxHr,
-      max_hr_source: observedMax >= 150 ? 'observed' : 'default',
-      zones,
-    });
+    weeks = weeks.slice().sort((a, b) => a.week_start.localeCompare(b.week_start));
+    if (!weeks.length) return res.status(404).json({ error: 'No plan found' });
+    res.json(await computeInsights(req.userId, weeks, clientToday(req)));
   } catch (err) {
     if (err.code === 'NO_STRAVA') return res.status(403).json({ error: 'Strava not connected' });
     const stravaError = err.response?.data;
@@ -769,6 +667,118 @@ router.get('/insights', requireAuth, async (req, res) => {
     res.status(err.response?.status ?? 500).json({ error: 'Failed to load insights', detail: stravaError });
   }
 });
+
+async function computeInsights(userId, weeks, today) {
+  const planStart = weeks[0].week_start;
+  const planEnd = weeks[weeks.length - 1].week_end;
+  const rangeEnd = today < planEnd ? today : planEnd;
+
+  // Past plans need no read-through: each was the current plan while syncing, so its runs are stored
+  await ensureBackfilled(userId);
+  const activities = today < planStart ? [] : await db.activities.between(userId, planStart, rangeEnd);
+  const activityDates = new Set(activities.map(activityLocalDate));
+  const runs = activities.filter(isRunType);
+
+  // ── Workout completion ──
+  const workoutStatus = { done: 0, made_up: 0, missed: 0, left: 0 };
+  const byType = {};
+  const weekly = [];
+  for (const week of weeks) {
+    const workouts = week.workouts ?? [];
+    const done = [];
+    const missed = [];
+    for (const w of workouts) {
+      if (activityDates.has(w.date)) done.push(w);
+      else if (w.date < today) missed.push(w);
+      else workoutStatus.left++;
+    }
+
+    const inWeek = r => {
+      const d = activityLocalDate(r);
+      return d >= week.week_start && d <= week.week_end;
+    };
+    const weekRuns = runs.filter(inWeek);
+    const pairs = matchMakeupRuns(
+      missed,
+      weekRuns.map(r => ({ date: activityLocalDate(r), name: r.name, km: +((r.distance || 0) / 1000).toFixed(2) })),
+      new Set(workouts.map(w => w.date)),
+    );
+    const madeUpDates = new Set(pairs.map(p => p.missed.date));
+    workoutStatus.done += done.length;
+    workoutStatus.made_up += pairs.length;
+    workoutStatus.missed += missed.length - pairs.length;
+
+    for (const w of workouts) {
+      if (w.date >= today && !activityDates.has(w.date)) continue; // not due yet
+      const t = (byType[w.type] ??= { type: w.type, due: 0, completed: 0 });
+      t.due++;
+      if (activityDates.has(w.date) || madeUpDates.has(w.date)) t.completed++;
+    }
+
+    const started = week.week_start <= today;
+    weekly.push({
+      week_number: week.week_number,
+      week_start: week.week_start,
+      phase: week.phase,
+      planned_km: +workouts.reduce((s, w) => s + (w.km || 0), 0).toFixed(1),
+      actual_km: started ? +(weekRuns.reduce((s, r) => s + (r.distance || 0), 0) / 1000).toFixed(1) : null,
+      runs: started ? weekRuns.length : null,
+    });
+  }
+
+  // ── Heart rate & zones ──
+  // Max HR isn't in the activity summaries' athlete scope, so take the highest seen
+  // in-plan — a reasonable proxy once a few hard sessions are logged.
+  const observedMax = Math.max(0, ...runs.map(r => r.max_heartrate || 0));
+  const maxHr = observedMax >= 150 ? Math.round(observedMax) : DEFAULT_MAX_HR;
+  const zones = HR_ZONES.map((z, i) => ({
+    zone: z.zone,
+    name: z.name,
+    min_bpm: i === 0 ? null : Math.round(HR_ZONES[i - 1].max * maxHr),
+    max_bpm: Number.isFinite(z.max) ? Math.round(z.max * maxHr) : null,
+    seconds: 0,
+    runs: 0,
+  }));
+
+  const plannedTypeByDate = new Map(weeks.flatMap(w => w.workouts ?? []).map(w => [w.date, w.type]));
+  const runRows = runs
+    .map(r => {
+      const row = {
+        id: String(r.id),
+        date: activityLocalDate(r),
+        name: r.name,
+        km: +((r.distance || 0) / 1000).toFixed(2),
+        moving_time: r.moving_time || 0,
+        pace_sec: r.distance > 0 ? Math.round(r.moving_time / (r.distance / 1000)) : null,
+        avg_hr: r.average_heartrate ? Math.round(r.average_heartrate) : null,
+        max_hr: r.max_heartrate ? Math.round(r.max_heartrate) : null,
+        elevation_m: r.total_elevation_gain ?? 0,
+        planned_type: plannedTypeByDate.get(activityLocalDate(r)) ?? null,
+      };
+      if (row.avg_hr) {
+        const pct = row.avg_hr / maxHr;
+        const z = zones[HR_ZONES.findIndex(hz => pct < hz.max)];
+        z.seconds += row.moving_time;
+        z.runs++;
+      }
+      return row;
+    })
+    .sort((a, b) => a.date.localeCompare(b.date));
+
+  return {
+    today,
+    plan_start: planStart,
+    plan_end: planEnd,
+    total_weeks: weeks.length,
+    workouts: workoutStatus,
+    by_type: Object.values(byType),
+    weekly,
+    runs: runRows,
+    max_hr: maxHr,
+    max_hr_source: observedMax >= 150 ? 'observed' : 'default',
+    zones,
+  };
+}
 
 router.get('/review/:activityId', requireAuth, async (req, res) => {
   const review = await db.run_reviews.find(req.userId, req.params.activityId);
@@ -1008,6 +1018,8 @@ router.get('/plan', requireAuth, async (req, res) => {
 router.post('/plan', requireAuth, async (req, res) => {
   const { distance_km, race_date, goal_time, goal_pace, weekly_km, days_per_week, running_days, long_run_day, experience, training_style, notes } = req.body;
   if (!distance_km || !race_date) return res.status(400).json({ error: 'distance_km and race_date are required' });
+  // This starts a new plan: never overwrite an existing one in place (finished → history, else discarded)
+  await db.past_plans.endCurrent(req.userId, clientToday(req));
   await db.marathon_overview.upsert(req.userId, { distance_km, race_date, goal_time, goal_pace, weekly_km, days_per_week, running_days, long_run_day, experience, training_style, notes });
   res.json({ ok: true });
 });
@@ -1155,6 +1167,7 @@ router.post('/upload-plan', requireAuth, async (req, res) => {
     const { running_days, long_run_day, experience, training_style, weekly_km, weeks } = JSON.parse(textBlock.text);
     if (!weeks?.length) return res.status(502).json({ error: 'Could not find any workouts in the file' });
 
+    await db.past_plans.endCurrent(req.userId, todayISO);
     await db.marathon_overview.upsert(req.userId, {
       distance_km, race_date, goal_time: goal_time || '', goal_pace: goal_pace || '',
       weekly_km, running_days, long_run_day, experience, training_style,
@@ -1177,10 +1190,26 @@ router.patch('/plan', requireAuth, async (req, res) => {
   res.json({ ok: true });
 });
 
-router.delete('/plan', requireAuth, async (req, res) => {
-  await db.marathon_overview.removeByUserId(req.userId);
-  await db.training_weeks.removeByUserId(req.userId);
-  await db.run_reviews.removeByUserId(req.userId);
+// "Start a new plan": a finished plan moves to Past plans (its run reviews stay, they're keyed
+// by activity); an unfinished one is deleted with its reviews
+router.post('/plan/end', requireAuth, async (req, res) => {
+  const result = await db.past_plans.endCurrent(req.userId, clientToday(req));
+  res.json({ ok: true, archived: result?.archived ?? null, deleted: !!result?.deleted });
+});
+
+router.get('/past-plans', requireAuth, async (req, res) => {
+  res.json(await db.past_plans.list(req.userId));
+});
+
+router.get('/past-plans/:id', requireAuth, async (req, res) => {
+  const plan = await db.past_plans.find(req.userId, Number(req.params.id));
+  if (!plan) return res.status(404).json({ error: 'Plan not found' });
+  res.json(plan);
+});
+
+router.delete('/past-plans/:id', requireAuth, async (req, res) => {
+  const removed = await db.past_plans.remove(req.userId, Number(req.params.id));
+  if (!removed) return res.status(404).json({ error: 'Plan not found' });
   res.json({ ok: true });
 });
 

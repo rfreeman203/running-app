@@ -108,6 +108,7 @@ router.delete('/account', requireAuth, async (req, res) => {
   await db.marathon_overview.removeByUserId(req.userId);
   await db.training_weeks.removeByUserId(req.userId);
   await db.run_reviews.removeByUserId(req.userId);
+  await db.past_plans.removeByUserId(req.userId);
   await db.activities.removeByUserId(req.userId);
   clearUserState(req.userId);
   res.json({ ok: true });

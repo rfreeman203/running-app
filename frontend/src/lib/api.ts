@@ -137,6 +137,29 @@ export interface Insights {
   zones: { zone: number; name: string; min_bpm: number | null; max_bpm: number | null; seconds: number; runs: number }[];
 }
 
+// A finished or replaced plan, as listed (GET /training/past-plans)
+export interface PastPlanSummary {
+  id: number;
+  distance_km: number | null;
+  race_date: string | null;
+  goal_time: string | null;
+  goal_pace: string | null;
+  plan_start: string;
+  plan_end: string;
+  archived_on: string | null;
+  archived_at: number;
+}
+
+export interface PastPlan {
+  id: number;
+  overview: Partial<MarathonPlan>;
+  weeks: TrainingWeek[];
+  plan_start: string;
+  plan_end: string;
+  archived_on: string | null;
+  archived_at: number;
+}
+
 export interface Bootstrap {
   plan: MarathonPlan | null;
   weeks: TrainingWeek[];
@@ -172,7 +195,11 @@ export const api = {
     bootstrap: () => request<Bootstrap>('/training/bootstrap'),
     sync: () => request<SyncResult>('/training/sync', { method: 'POST' }),
     stats: () => request<AthleteStats>('/training/stats'),
-    insights: () => request<Insights>('/training/insights'),
+    insights: (planId?: number) =>
+      request<Insights>(`/training/insights${planId != null ? `?plan=${planId}` : ''}`),
+    pastPlans: () => request<PastPlanSummary[]>('/training/past-plans'),
+    pastPlan: (id: number) => request<PastPlan>(`/training/past-plans/${id}`),
+    deletePastPlan: (id: number) => request<{ ok: boolean }>(`/training/past-plans/${id}`, { method: 'DELETE' }),
     getPlan: () => request<MarathonPlan>('/training/plan'),
     savePlan: (body: { distance_km: number; race_date: string; goal_time: string; goal_pace: string; weekly_km?: number; days_per_week?: number; running_days?: string[]; long_run_day?: string; experience?: string; training_style?: string; notes?: string }) =>
       request<{ ok: boolean }>('/training/plan', { method: 'POST', body: JSON.stringify(body) }),
@@ -184,7 +211,9 @@ export const api = {
       request<{ ok: boolean; weeks: number }>('/training/upload-plan', { method: 'POST', body: JSON.stringify(body) }),
     saveSummaries: (body: { week_summary?: string; plan_summary?: string }) =>
       request<{ ok: boolean }>('/training/plan', { method: 'PATCH', body: JSON.stringify(body) }),
-    deletePlan: () => request<{ ok: boolean }>('/training/plan', { method: 'DELETE' }),
+    // Clears the current plan for a new one: finished → Past plans, unfinished → deleted
+    endPlan: () =>
+      request<{ ok: boolean; archived: number | null; deleted: boolean }>('/training/plan/end', { method: 'POST' }),
     weeks: () => request<TrainingWeek[]>('/training/weeks'),
     getReview: (activityId: number | string) =>
       request<RunReview>(`/training/review/${activityId}`),

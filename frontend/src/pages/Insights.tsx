@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { type Insights, type InsightsRun } from '../lib/api';
-import { loadInsights, persistedInsights } from '../lib/insightsCache';
+import { type Insights, type InsightsRun, type PastPlanSummary } from '../lib/api';
+import { loadInsights, loadPastInsights, persistedInsights } from '../lib/insightsCache';
+import { pastPlanLabel } from '../lib/plans';
+import * as persist from '../lib/persist';
 import Splash from '../components/Splash';
 
 // Chart palette — validated (dataviz validate_palette.js) against the card surface #1E293B.
@@ -8,6 +10,8 @@ import Splash from '../components/Splash';
 const C = {
   planned: '#3987e5',
   actual: '#d95926',
+  // A past plan in comparisons — also drawn dashed, so it never relies on hue alone
+  compare: '#309e7e',
   done: '#3987e5',
   missed: '#d03b3b',
   left: '#475569',
@@ -33,6 +37,11 @@ function fmtDuration(sec: number) {
 function fmtDate(iso: string) {
   const [y, m, d] = iso.split('-').map(Number);
   return new Date(y, m - 1, d).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+
+function fmtLongDate(iso: string) {
+  const [y, m, d] = iso.split('-').map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' });
 }
 
 function roundKm(km: number) {
@@ -67,32 +76,85 @@ function useWidth<T extends HTMLElement>() {
   return [ref, width] as const;
 }
 
-export default function Insights({ planVersion, dataVersion }: { planVersion: number; dataVersion: number }) {
+// A past plan's insights alongside the current plan's
+export interface Comparison { label: string; data: Insights }
+
+export default function Insights({ planVersion, dataVersion, planId, pastPlans = [], header }: {
+  planVersion: number;
+  dataVersion: number;
+  planId?: number;              // a past plan, read-only; omitted = the current plan
+  pastPlans?: PastPlanSummary[]; // offered in "Compare with" (current plan only)
+  header?: React.ReactNode;
+}) {
+  const past = planId != null;
   // Last session's copy paints immediately; the fresh one replaces it when it lands
-  const [data, setData] = useState<Insights | null>(() => persistedInsights());
+  const [data, setData] = useState<Insights | null>(() => (past ? null : persistedInsights()));
   const [error, setError] = useState('');
+  const [compareId, setCompareId] = useState<number | null>(() => (past ? null : persist.load<number>('compare')));
+  const [compareData, setCompareData] = useState<Insights | null>(null);
+  const comparePlan = past ? undefined : pastPlans.find(p => p.id === compareId);
 
   useEffect(() => {
     let cancelled = false;
     const today = new Date().toDateString(); // missed/left counts roll over daily
-    loadInsights(`${planVersion}:${dataVersion}:${today}`)
+    (past ? loadPastInsights(planId, dataVersion) : loadInsights(`${planVersion}:${dataVersion}:${today}`))
       .then(d => { if (!cancelled) { setData(d); setError(''); } })
       .catch(err => { if (!cancelled) setError(err.message); });
     return () => { cancelled = true; };
-  }, [planVersion, dataVersion]);
+  }, [planVersion, dataVersion, planId]);
 
-  if (error && !data) return <p style={{ color: '#F87171' }}>{error}</p>;
-  if (!data) return <Splash message="Crunching your training insights…" />;
+  useEffect(() => {
+    setCompareData(null);
+    if (!comparePlan) return;
+    let cancelled = false;
+    loadPastInsights(comparePlan.id, dataVersion)
+      .then(d => { if (!cancelled) setCompareData(d); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [comparePlan?.id, dataVersion]);
+
+  function pickCompare(id: number | null) {
+    setCompareId(id);
+    if (id == null) persist.remove('compare');
+    else persist.save('compare', id);
+  }
+
+  if (error && !data) return <div style={s.page}>{header}<p style={{ color: '#F87171' }}>{error}</p></div>;
+  if (!data) return <div style={s.page}>{header}<Splash message="Crunching your training insights…" /></div>;
+
+  const cmp: Comparison | undefined = comparePlan && compareData ? { label: pastPlanLabel(comparePlan), data: compareData } : undefined;
 
   return (
     <div style={s.page}>
-      <SummaryTiles data={data} />
+      {header}
+      {!past && pastPlans.length > 0 && (
+        <div style={s.compareBar}>
+          <label style={s.compareLabel} htmlFor="insights-compare">Compare with</label>
+          <select
+            id="insights-compare"
+            style={s.compareSelect}
+            value={comparePlan?.id ?? ''}
+            onChange={e => pickCompare(e.target.value ? Number(e.target.value) : null)}
+          >
+            <option value="">No comparison</option>
+            {pastPlans.map(p => <option key={p.id} value={p.id}>{pastPlanLabel(p)}</option>)}
+          </select>
+          {comparePlan && !compareData && <span style={s.caption}>Loading…</span>}
+        </div>
+      )}
+      {data.today < data.plan_start && (
+        <div style={s.notice}>
+          Your plan starts <strong style={{ color: 'var(--text)' }}>{fmtLongDate(data.plan_start)}</strong> with{' '}
+          {data.workouts.left} workouts scheduled. These insights fill in as you log runs.
+        </div>
+      )}
+      <SummaryTiles data={data} compare={cmp} />
       <div style={s.row} className="insights-row">
         <Card title="Workouts" style={{ flex: '1 1 300px' }}>
           <WorkoutDonut data={data} />
         </Card>
         <Card title="Weekly mileage vs plan" style={{ flex: '3 1 480px' }}>
-          <MileageChart weekly={data.weekly} />
+          <MileageChart weekly={data.weekly} compare={cmp} />
         </Card>
       </div>
       <div style={s.row} className="insights-row">
@@ -106,7 +168,7 @@ export default function Insights({ planVersion, dataVersion }: { planVersion: nu
           />
         </Card>
         <Card title="Training zones" style={{ flex: '2 1 320px' }}>
-          <ZoneChart data={data} />
+          <ZoneChart data={data} compare={cmp} />
         </Card>
       </div>
       <div style={s.row} className="insights-row">
@@ -139,7 +201,8 @@ function Card({ title, children, style }: { title: string; children: React.React
 
 // ── Headline numbers ──────────────────────────────────────────────────────────
 
-function SummaryTiles({ data }: { data: Insights }) {
+// Headline numbers for one plan, shared by the tiles and their comparison line
+function tileStats(data: Insights) {
   const { workouts: w, weekly, runs } = data;
   const due = w.done + w.made_up + w.missed;
   const completion = due ? Math.round(((w.done + w.made_up) / due) * 100) : null;
@@ -159,22 +222,47 @@ function SummaryTiles({ data }: { data: Insights }) {
   const hrRuns = runs.filter(r => r.avg_hr != null);
   const avgHr = hrRuns.length ? Math.round(hrRuns.reduce((sum, r) => sum + r.avg_hr!, 0) / hrRuns.length) : null;
 
+  return {
+    w, due, completion, plannedToDate, actualToDate, finished, onTarget, longest, avgHr, runs: runs.length,
+    // Plans differ in length and progress, so totals don't compare — weekly averages do
+    avgWeekKm: startedWeeks.length ? actualToDate / startedWeeks.length : null,
+    onTargetPct: finished.length ? Math.round((onTarget / finished.length) * 100) : null,
+    pace: totalKm ? totalSec / totalKm : null,
+  };
+}
+
+function SummaryTiles({ data, compare }: { data: Insights; compare?: Comparison }) {
+  const t = tileStats(data);
+  const c = compare ? tileStats(compare.data) : null;
+  const vs = (v: string | null) => `vs ${v ?? '—'}`;
+
   const tiles = [
-    { label: 'Workouts completed', value: completion != null ? `${completion}%` : '—', sub: `${w.done + w.made_up} of ${due} due` },
-    { label: 'Km run in plan', value: `${Math.round(actualToDate)}`, sub: `${Math.round(plannedToDate)} km planned to date` },
-    { label: 'Weeks on target', value: finished.length ? `${onTarget}/${finished.length}` : '—', sub: '≥ 90% of planned km' },
-    { label: 'Longest run', value: longest ? `${longest.km.toFixed(1)} km` : '—', sub: longest ? fmtDate(longest.date) : 'no runs yet' },
-    { label: 'Average pace', value: totalKm ? fmtPace(totalSec / totalKm) : '—', sub: `per km · ${runs.length} runs` },
-    { label: 'Average HR', value: avgHr ? `${avgHr}` : '—', sub: avgHr ? `bpm · max ${data.max_hr}` : 'no HR data' },
+    { label: 'Workouts completed', value: t.completion != null ? `${t.completion}%` : '—', sub: t.due ? `${t.w.done + t.w.made_up} of ${t.due} due` : `none due yet · ${t.w.left} scheduled`,
+      cmp: c && vs(c.completion != null ? `${c.completion}%` : null) },
+    { label: 'Km run in plan', value: `${Math.round(t.actualToDate)}`, sub: `${Math.round(t.plannedToDate)} km planned to date`,
+      cmp: c && `${t.avgWeekKm != null ? Math.round(t.avgWeekKm) : '—'} vs ${c.avgWeekKm != null ? Math.round(c.avgWeekKm) : '—'} km/week` },
+    { label: 'Weeks on target', value: t.finished.length ? `${t.onTarget}/${t.finished.length}` : '—', sub: '≥ 90% of planned km',
+      cmp: c && `${t.onTargetPct != null ? `${t.onTargetPct}%` : '—'} vs ${c.onTargetPct != null ? `${c.onTargetPct}%` : '—'} of weeks` },
+    { label: 'Longest run', value: t.longest ? `${t.longest.km.toFixed(1)} km` : '—', sub: t.longest ? fmtDate(t.longest.date) : 'no runs yet',
+      cmp: c && vs(c.longest ? `${c.longest.km.toFixed(1)} km` : null) },
+    { label: 'Average pace', value: t.pace ? fmtPace(t.pace) : '—', sub: `per km · ${t.runs} runs`,
+      cmp: c && vs(c.pace ? `${fmtPace(c.pace)} /km` : null) },
+    { label: 'Average HR', value: t.avgHr ? `${t.avgHr}` : '—', sub: t.avgHr ? `bpm · max ${data.max_hr}` : 'no HR data',
+      cmp: c && vs(c.avgHr ? `${c.avgHr} bpm` : null) },
   ];
 
   return (
     <div style={s.tiles}>
-      {tiles.map(t => (
-        <div key={t.label} style={s.tile}>
-          <span style={s.tileLabel}>{t.label}</span>
-          <span style={s.tileValue}>{t.value}</span>
-          <span style={s.tileSub}>{t.sub}</span>
+      {tiles.map(tile => (
+        <div key={tile.label} style={s.tile}>
+          <span style={s.tileLabel}>{tile.label}</span>
+          <span style={s.tileValue}>{tile.value}</span>
+          <span style={s.tileSub}>{tile.sub}</span>
+          {tile.cmp && (
+            <span style={s.tileCmp} title={compare!.label}>
+              <span style={{ ...s.dashKey, borderColor: C.compare }} />{tile.cmp}
+            </span>
+          )}
         </div>
       ))}
     </div>
@@ -232,7 +320,7 @@ function WorkoutDonut({ data }: { data: Insights }) {
           })}
         </g>
         <text x={cx} y={cy - 2} textAnchor="middle" style={s.donutValue}>
-          {hover != null ? slices[hover].value : `${pct}%`}
+          {hover != null ? slices[hover].value : due ? `${pct}%` : '—'}
         </text>
         <text x={cx} y={cy + 18} textAnchor="middle" style={s.donutLabel}>
           {hover != null ? slices[hover].label.toLowerCase() : 'completed'}
@@ -258,7 +346,7 @@ function WorkoutDonut({ data }: { data: Insights }) {
 
 // ── Weekly mileage: actual vs plan ────────────────────────────────────────────
 
-function MileageChart({ weekly }: { weekly: Insights['weekly'] }) {
+function MileageChart({ weekly, compare }: { weekly: Insights['weekly']; compare?: Comparison }) {
   // One selector: picking Weekly or Cumulative always returns to the chart
   const [view, setView] = useState<'weekly' | 'cumulative' | 'table'>('weekly');
   const [hover, setHover] = useState<number | null>(null);
@@ -270,21 +358,33 @@ function MileageChart({ weekly }: { weekly: Insights['weekly'] }) {
     if (w.actual_km != null) cumA += w.actual_km;
     return { ...w, cum_planned: roundKm(cumP), cum_actual: w.actual_km != null ? roundKm(cumA) : null };
   });
-  const points = rows.map(w => view === 'cumulative'
-    ? { ...w, p: w.cum_planned, a: w.cum_actual }
-    : { ...w, p: w.planned_km, a: w.actual_km });
+  // The past plan's actual km, aligned on race week (last week under last week): peak and
+  // taper sit a fixed distance from the race whatever each plan's length
+  let cumC = 0;
+  const pastRows = (compare?.data.weekly ?? []).map(w => {
+    if (w.actual_km != null) cumC += w.actual_km;
+    return { week_number: w.week_number, actual: w.actual_km, cum: w.actual_km != null ? roundKm(cumC) : null };
+  });
+  const shift = rows.length - pastRows.length;
+  const pastAt = (i: number) => pastRows[i - shift] ?? null;
+  const points = rows.map((w, i) => {
+    const pr = pastAt(i);
+    return view === 'cumulative'
+      ? { ...w, p: w.cum_planned, a: w.cum_actual, c: pr?.cum ?? null, cWeek: pr?.week_number ?? null }
+      : { ...w, p: w.planned_km, a: w.actual_km, c: pr?.actual ?? null, cWeek: pr?.week_number ?? null };
+  });
 
   const height = 240;
   const pad = { top: 16, right: 16, bottom: 28, left: 40 };
   const innerW = Math.max(0, width - pad.left - pad.right);
   const innerH = height - pad.top - pad.bottom;
-  const yMax = Math.max(1, ...points.map(p => Math.max(p.p, p.a ?? 0)));
+  const yMax = Math.max(1, ...points.map(p => Math.max(p.p, p.a ?? 0, p.c ?? 0)));
   const { max, step } = niceScale(yMax);
   const n = points.length;
   const x = (i: number) => pad.left + (n > 1 ? (i / (n - 1)) * innerW : innerW / 2);
   const y = (v: number) => pad.top + innerH - (v / max) * innerH;
 
-  const line = (key: 'p' | 'a') => points
+  const line = (key: 'p' | 'a' | 'c') => points
     .map((p, i) => (p[key] == null ? null : `${x(i)},${y(p[key] as number)}`))
     .filter(Boolean)
     .join(' ');
@@ -305,6 +405,9 @@ function MileageChart({ weekly }: { weekly: Insights['weekly'] }) {
         <div style={s.legendInline}>
           <span style={s.legendItem}><span style={{ ...s.lineKey, background: C.planned }} />Planned</span>
           <span style={s.legendItem}><span style={{ ...s.lineKey, background: C.actual }} />Actual</span>
+          {compare && (
+            <span style={s.legendItem}><span style={{ ...s.dashKey, borderColor: C.compare }} />{compare.label}</span>
+          )}
         </div>
         <div style={s.tabs}>
           {(['weekly', 'cumulative', 'table'] as const).map(v => (
@@ -324,10 +427,12 @@ function MileageChart({ weekly }: { weekly: Insights['weekly'] }) {
                 <th style={s.thNum}>Planned km</th><th style={s.thNum}>Actual km</th>
                 <th style={s.thNum}>Cum. planned</th><th style={s.thNum}>Cum. actual</th>
                 <th style={s.thNum}>Runs</th>
+                {compare && <th style={s.thNum} title={compare.label}>Prev. actual</th>}
+                {compare && <th style={s.thNum} title={compare.label}>Prev. cum.</th>}
               </tr>
             </thead>
             <tbody>
-              {rows.map(w => (
+              {rows.map((w, i) => (
                 <tr key={w.week_number}>
                   <td style={s.td}>{w.week_number} · {fmtDate(w.week_start)}</td>
                   <td style={s.td}>{titleCase(w.phase)}</td>
@@ -336,6 +441,8 @@ function MileageChart({ weekly }: { weekly: Insights['weekly'] }) {
                   <td style={s.tdNum}>{w.cum_planned}</td>
                   <td style={s.tdNum}>{w.cum_actual ?? '—'}</td>
                   <td style={s.tdNum}>{w.runs ?? '—'}</td>
+                  {compare && <td style={s.tdNum}>{pastAt(i)?.actual ?? '—'}</td>}
+                  {compare && <td style={s.tdNum}>{pastAt(i)?.cum ?? '—'}</td>}
                 </tr>
               ))}
             </tbody>
@@ -355,6 +462,10 @@ function MileageChart({ weekly }: { weekly: Insights['weekly'] }) {
                 <text key={p.week_number} x={x(i)} y={height - 8} textAnchor="middle" style={s.axisText}>W{p.week_number}</text>
               ))}
 
+              {compare && (
+                <polyline points={line('c')} fill="none" stroke={C.compare} strokeWidth={2} strokeDasharray="6 4"
+                  strokeLinejoin="round" strokeLinecap="round" />
+              )}
               <polyline points={line('p')} fill="none" stroke={C.planned} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
               <polyline points={line('a')} fill="none" stroke={C.actual} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
               {lastActual >= 0 && (
@@ -366,6 +477,7 @@ function MileageChart({ weekly }: { weekly: Insights['weekly'] }) {
                   <line x1={x(hover)} x2={x(hover)} y1={pad.top} y2={pad.top + innerH} stroke={C.axis} strokeWidth={1} />
                   <circle cx={x(hover)} cy={y(hp.p)} r={4.5} fill={C.planned} stroke={C.surface} strokeWidth={2} />
                   {hp.a != null && <circle cx={x(hover)} cy={y(hp.a)} r={4.5} fill={C.actual} stroke={C.surface} strokeWidth={2} />}
+                  {hp.c != null && <circle cx={x(hover)} cy={y(hp.c)} r={4.5} fill={C.compare} stroke={C.surface} strokeWidth={2} />}
                 </g>
               )}
               <rect x={pad.left} y={pad.top} width={innerW} height={innerH} fill="transparent"
@@ -380,6 +492,10 @@ function MileageChart({ weekly }: { weekly: Insights['weekly'] }) {
               <TtRow color={C.actual} label="Actual" value={hp.a != null ? `${hp.a.toFixed(1)} km` : 'upcoming'} />
               {hp.a != null && hp.p > 0 && (
                 <div style={s.ttSub}>{Math.round((hp.a / hp.p) * 100)}% of plan</div>
+              )}
+              {compare && (
+                <TtRow color={C.compare} label={hp.cWeek != null ? `Prev. plan wk ${hp.cWeek}` : 'Prev. plan'}
+                  value={hp.c != null ? `${hp.c.toFixed(1)} km` : '—'} />
               )}
             </Tooltip>
           )}
@@ -496,7 +612,13 @@ function RunTrendChart({ runs, value, format, invert = false, empty, caption }: 
 
 // ── Time in HR zone ───────────────────────────────────────────────────────────
 
-function ZoneChart({ data }: { data: Insights }) {
+function easyShareOf(data: Insights) {
+  const total = data.zones.reduce((sum, z) => sum + z.seconds, 0);
+  return total ? Math.round(((data.zones[0].seconds + data.zones[1].seconds) / total) * 100) : null;
+}
+
+function ZoneChart({ data, compare }: { data: Insights; compare?: Comparison }) {
+  const prevEasy = compare ? easyShareOf(compare.data) : null;
   const [hover, setHover] = useState<number | null>(null);
   const total = data.zones.reduce((sum, z) => sum + z.seconds, 0);
   if (!total) return <p style={s.empty}>No heart-rate data on your runs yet.</p>;
@@ -528,6 +650,9 @@ function ZoneChart({ data }: { data: Insights }) {
       <p style={s.note}>
         <strong style={{ color: 'var(--text)' }}>{easyShare}%</strong> of your run time was in Z1–Z2.
         {easyShare < 70 ? ' Most plans aim for ~80% easy — consider slowing your easy days.' : ' That’s a healthy easy/hard balance.'}
+        {compare && prevEasy != null && (
+          <> In {compare.label} it was <strong style={{ color: 'var(--text)' }}>{prevEasy}%</strong>.</>
+        )}
       </p>
       <p style={s.footnote}>
         Each run is placed by its average HR, with zones as % of max HR ({data.max_hr} bpm
@@ -601,6 +726,21 @@ const s: Record<string, React.CSSProperties> = {
   tileLabel: { fontSize: 12, color: 'var(--text-muted)' },
   tileValue: { fontSize: 26, fontWeight: 600, color: 'var(--text)', lineHeight: 1.15 },
   tileSub: { fontSize: 12, color: 'var(--text-muted)' },
+  notice: {
+    background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 12,
+    padding: '12px 16px', fontSize: 14, color: 'var(--text-muted)', lineHeight: 1.5,
+  },
+  tileCmp: {
+    fontSize: 12, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 6,
+    marginTop: 4, paddingTop: 6, borderTop: '1px solid var(--border)',
+  },
+  dashKey: { width: 14, height: 0, borderTop: '2px dashed', display: 'inline-block', flexShrink: 0 },
+  compareBar: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' },
+  compareLabel: { fontSize: 13, color: 'var(--text-muted)' },
+  compareSelect: {
+    background: 'var(--surface)', color: 'var(--text)', border: '1px solid var(--border)',
+    borderRadius: 8, padding: '6px 10px', fontSize: 13, maxWidth: '100%',
+  },
   donutWrap: { display: 'flex', alignItems: 'center', gap: 24, flexWrap: 'wrap', justifyContent: 'center', flex: 1 },
   donutValue: { fontSize: 30, fontWeight: 600, fill: 'var(--text)' },
   donutLabel: { fontSize: 12, fill: 'var(--text-muted)' },

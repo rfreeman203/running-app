@@ -1,13 +1,15 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
-import { api, clearToken, type Activity, type AthleteStats, type Bootstrap, type RunReview, type SyncResult, type TrainingWeek, type User, type Workout } from '../lib/api';
+import { api, clearToken, type Activity, type AthleteStats, type Bootstrap, type PastPlanSummary, type RunReview, type SyncResult, type TrainingWeek, type User, type Workout } from '../lib/api';
 import { useNavigate } from 'react-router-dom';
 import Splash from '../components/Splash';
 import * as persist from '../lib/persist';
 import { slimActivity } from '../lib/persist';
 import { invalidateInsights } from '../lib/insightsCache';
+import { pastPlanLabel } from '../lib/plans';
 
-// Chart code only loads when the Insights tab is opened
+// Chart code only loads when the Insights tab (or a past plan) is opened
 const Insights = lazy(() => import('./Insights'));
+const PastPlan = lazy(() => import('./PastPlan'));
 
 interface Props {
   user: User;
@@ -124,6 +126,10 @@ export default function Dashboard({ user, onSignOut }: Props) {
   // Direction of the last swipe, so the incoming tab slides in from the matching side
   const [swipeDir, setSwipeDir] = useState<'left' | 'right' | null>(null);
   const swipeStart = useRef<{ x: number; y: number; t: number } | null>(null);
+  // Finished/replaced plans (Settings → Past plans); one open read-only replaces the tabs
+  const [pastPlans, setPastPlans] = useState<PastPlanSummary[]>([]);
+  const [viewingPastId, setViewingPastId] = useState<number | null>(null);
+  const viewingPast = pastPlans.find(p => p.id === viewingPastId) ?? null;
   const [hasPlan, setHasPlan] = useState(false);
   const [uploadedPlan, setUploadedPlan] = useState<File | null>(null);
   const [showPlanModal, setShowPlanModal] = useState(false);
@@ -335,6 +341,17 @@ export default function Dashboard({ user, onSignOut }: Props) {
     ? `${weeksLeft} week${weeksLeft === 1 ? '' : 's'} left${remainingKm !== null ? ` · ${Math.round(remainingKm)} km` : ''}`
     : '';
 
+  function refreshPastPlans() {
+    api.training.pastPlans().then(setPastPlans).catch(() => {});
+  }
+  useEffect(refreshPastPlans, [planVersion]);
+
+  function openPastPlan(id: number) {
+    setMenuOpen(false);
+    setViewingPastId(id);
+    window.scrollTo({ top: 0 });
+  }
+
   function onSwipeStart(e: React.TouchEvent) {
     const t = e.touches[0];
     // Leave gestures inside horizontally scrollable content (wide tables) to that content
@@ -346,7 +363,7 @@ export default function Dashboard({ user, onSignOut }: Props) {
   function onSwipeEnd(e: React.TouchEvent) {
     const start = swipeStart.current;
     swipeStart.current = null;
-    if (!start || !hasPlan || loading) return;
+    if (!start || !hasPlan || loading || viewingPast) return;
     const t = e.changedTouches[0];
     const dx = t.clientX - start.x;
     const dy = t.clientY - start.y;
@@ -362,6 +379,7 @@ export default function Dashboard({ user, onSignOut }: Props) {
 
   function selectView(v: typeof view) {
     setSwipeDir(null);
+    setViewingPastId(null);
     setView(v);
   }
 
@@ -376,15 +394,15 @@ export default function Dashboard({ user, onSignOut }: Props) {
             {hasPlan && (
               <nav style={styles.nav} className="nav-desktop">
                 <button
-                  style={{ ...styles.navLink, ...(view === 'overview' ? styles.navLinkActive : {}) }}
+                  style={{ ...styles.navLink, ...(!viewingPast && view === 'overview' ? styles.navLinkActive : {}) }}
                   onClick={() => selectView('overview')}
                 >Overview</button>
                 <button
-                  style={{ ...styles.navLink, ...(view === 'calendar' ? styles.navLinkActive : {}) }}
+                  style={{ ...styles.navLink, ...(!viewingPast && view === 'calendar' ? styles.navLinkActive : {}) }}
                   onClick={() => selectView('calendar')}
                 >Calendar</button>
                 <button
-                  style={{ ...styles.navLink, ...(view === 'insights' ? styles.navLinkActive : {}) }}
+                  style={{ ...styles.navLink, ...(!viewingPast && view === 'insights' ? styles.navLinkActive : {}) }}
                   onClick={() => selectView('insights')}
                 >Insights</button>
               </nav>
@@ -419,7 +437,7 @@ export default function Dashboard({ user, onSignOut }: Props) {
                         style={styles.dropdownItem}
                         onClick={() => { setMenuOpen(false); setConfirmRecreatePlan(true); }}
                       >
-                        <span>Recreate plan</span>
+                        <span>Start a new plan</span>
                       </button>
                       <button
                         style={styles.dropdownItem}
@@ -427,6 +445,21 @@ export default function Dashboard({ user, onSignOut }: Props) {
                       >
                         <span>Upload running plan</span>
                       </button>
+                      <div style={styles.divider} />
+                    </>
+                  )}
+                  {pastPlans.length > 0 && (
+                    <>
+                      <div style={styles.dropdownLabel}>Past plans</div>
+                      {pastPlans.map(p => (
+                        <button
+                          key={p.id}
+                          style={{ ...styles.dropdownItem, ...(viewingPastId === p.id ? { background: 'var(--surface-2)' } : {}) }}
+                          onClick={() => openPastPlan(p.id)}
+                        >
+                          <span>{pastPlanLabel(p)}</span>
+                        </button>
+                      ))}
                       <div style={styles.divider} />
                     </>
                   )}
@@ -452,15 +485,15 @@ export default function Dashboard({ user, onSignOut }: Props) {
           <div style={styles.navRow} className="nav-row-mobile">
             <nav style={styles.nav}>
               <button
-                style={{ ...styles.navLink, ...(view === 'overview' ? styles.navLinkActive : {}) }}
+                style={{ ...styles.navLink, ...(!viewingPast && view === 'overview' ? styles.navLinkActive : {}) }}
                 onClick={() => selectView('overview')}
               >Overview</button>
               <button
-                style={{ ...styles.navLink, ...(view === 'calendar' ? styles.navLinkActive : {}) }}
+                style={{ ...styles.navLink, ...(!viewingPast && view === 'calendar' ? styles.navLinkActive : {}) }}
                 onClick={() => selectView('calendar')}
               >Calendar</button>
               <button
-                style={{ ...styles.navLink, ...(view === 'insights' ? styles.navLinkActive : {}) }}
+                style={{ ...styles.navLink, ...(!viewingPast && view === 'insights' ? styles.navLinkActive : {}) }}
                 onClick={() => selectView('insights')}
               >Insights</button>
             </nav>
@@ -478,7 +511,21 @@ export default function Dashboard({ user, onSignOut }: Props) {
         {loading && <Splash message="Loading your training data…" />}
         {error && <p style={{ color: '#F87171' }}>{error}</p>}
 
-        {!loading && !hasPlan && (
+        {!loading && viewingPast && (
+          <div key={`past-${viewingPast.id}`} style={styles.viewWrap}>
+            <Suspense fallback={<Splash message="Loading plan…" />}>
+              <PastPlan
+                plan={viewingPast}
+                dataVersion={dataVersion}
+                hasCurrentPlan={hasPlan}
+                onBack={() => setViewingPastId(null)}
+                onDeleted={() => { setViewingPastId(null); refreshPastPlans(); }}
+              />
+            </Suspense>
+          </div>
+        )}
+
+        {!loading && !hasPlan && !viewingPast && (
           <div style={styles.noPlanWrap}>
             <div style={styles.noPlanCard}>
               <div style={styles.noPlanIcon}>🏃</div>
@@ -497,11 +544,19 @@ export default function Dashboard({ user, onSignOut }: Props) {
                   Upload a plan
                 </button>
               </div>
+              {pastPlans.length > 0 && (
+                <div style={styles.noPlanPast}>
+                  <span>Review a past plan:</span>
+                  {pastPlans.map(p => (
+                    <button key={p.id} style={styles.noPlanPastBtn} onClick={() => openPastPlan(p.id)}>{pastPlanLabel(p)}</button>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         )}
 
-        {!loading && hasPlan && (
+        {!loading && hasPlan && !viewingPast && (
           <div key={view} style={styles.viewWrap} className={swipeDir ? `swipe-in-${swipeDir}` : undefined}>
         {view === 'overview' && (
           <div style={ovStyles.grid} className="ov-grid">
@@ -529,7 +584,7 @@ export default function Dashboard({ user, onSignOut }: Props) {
 
         {view === 'insights' && (
           <Suspense fallback={<Splash message="Loading insights…" />}>
-            <Insights planVersion={planVersion} dataVersion={dataVersion} />
+            <Insights planVersion={planVersion} dataVersion={dataVersion} pastPlans={pastPlans} />
           </Suspense>
         )}
           </div>
@@ -539,10 +594,14 @@ export default function Dashboard({ user, onSignOut }: Props) {
       {confirmRecreatePlan && (
         <div style={styles.overlay}>
           <div style={styles.modal}>
-            <h2 style={styles.modalTitle}>Recreate plan?</h2>
+            <h2 style={styles.modalTitle}>Start a new plan?</h2>
+            {/* Finished plans are kept for history and comparison; an abandoned one is just discarded */}
             <p style={styles.modalBody}>
-              Your current training plan will be deleted and a new one will be generated.
-              This action cannot be undone.
+              {planEnded()
+                ? <>Your finished plan will be moved to Past plans in the settings menu, with its
+                    insights and run reviews kept. You can compare your new plan against it.</>
+                : <>Your current plan isn't finished, so it will be deleted along with its run
+                    reviews. Only finished plans are kept in Past plans. This can't be undone.</>}
             </p>
             <div style={styles.modalActions}>
               <button style={styles.cancelBtn} onClick={() => setConfirmRecreatePlan(false)}>
@@ -550,7 +609,7 @@ export default function Dashboard({ user, onSignOut }: Props) {
               </button>
               <button style={styles.confirmBtn} onClick={() => {
                 setConfirmRecreatePlan(false);
-                api.training.deletePlan().catch(() => {});
+                api.training.endPlan().then(refreshPastPlans).catch(() => {});
                 setHasPlan(false);
                 setGenDistance('marathon');
                 setGenCustomKm('');
@@ -571,7 +630,7 @@ export default function Dashboard({ user, onSignOut }: Props) {
                 resetPlanCaches();
                 setPlanVersion(v => v + 1);
               }}>
-                Recreate plan
+                Start a new plan
               </button>
             </div>
           </div>
@@ -2759,6 +2818,18 @@ const styles: Record<string, React.CSSProperties> = {
   main: { flex: 1, display: 'flex', flexDirection: 'column', padding: '16px 24px', overflow: 'hidden', minHeight: 0 },
   // Keyed per tab so a swipe replays the slide-in; passes main's flex layout through
   viewWrap: { flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 },
+  dropdownLabel: {
+    padding: '10px 16px 4px', fontSize: 11, fontWeight: 700, color: 'var(--text-muted)',
+    textTransform: 'uppercase', letterSpacing: '0.05em',
+  },
+  noPlanPast: {
+    display: 'flex', flexWrap: 'wrap', justifyContent: 'center', alignItems: 'center', gap: 8,
+    marginTop: 20, fontSize: 13, color: 'var(--text-muted)',
+  },
+  noPlanPastBtn: {
+    background: 'none', border: '1px solid var(--border)', color: 'var(--text)', borderRadius: 999,
+    padding: '4px 12px', fontSize: 13, cursor: 'pointer',
+  },
   muted: { color: 'var(--text-muted)', textAlign: 'center', padding: 40 },
   overlay: {
     position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',

@@ -123,6 +123,20 @@ async function init() {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS strava_covered_from TEXT;
     -- Bumped whenever a sync changes stored activities; clients drop persisted caches when it moves
     ALTER TABLE users ADD COLUMN IF NOT EXISTS activities_version BIGINT;
+
+    -- Finished/replaced plans. A frozen snapshot (overview row + weeks with workouts) taken
+    -- when a new plan replaces the current one; activities and reviews are shared, not copied.
+    CREATE TABLE IF NOT EXISTS past_plans (
+      id BIGSERIAL PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      overview JSONB NOT NULL,
+      weeks JSONB NOT NULL,
+      plan_start TEXT,
+      plan_end TEXT,
+      archived_on TEXT,
+      archived_at BIGINT
+    );
+    CREATE INDEX IF NOT EXISTS past_plans_user_idx ON past_plans (user_id);
   `);
 }
 
@@ -389,6 +403,76 @@ const db = {
     },
     async removeByUserId(userId) {
       await pool.query('DELETE FROM activities WHERE user_id = $1', [userId]);
+    },
+  },
+
+  past_plans: {
+    // Clear the current plan to make way for a new one, in one transaction. A finished plan
+    // (its last day is before `today`) moves into history; an unfinished one is discarded,
+    // along with the run reviews in its date range, which were judged against its workouts.
+    // Returns { archived: id } or { deleted: true }, or null when there was no plan.
+    async endCurrent(userId, today) {
+      const [overview, weeks] = await Promise.all([
+        db.marathon_overview.findByUserId(userId),
+        db.training_weeks.findByUserId(userId),
+      ]);
+      if (!overview && !weeks.length) return null;
+      const sorted = weeks.slice().sort((a, b) => a.week_start.localeCompare(b.week_start));
+      const planStart = sorted[0]?.week_start;
+      const planEnd = sorted[sorted.length - 1]?.week_end;
+      const finished = !!planEnd && planEnd < today;
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        let id = null;
+        if (finished) {
+          const { rows } = await client.query(
+            `INSERT INTO past_plans (user_id, overview, weeks, plan_start, plan_end, archived_on, archived_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+            [userId, JSON.stringify(overview ?? {}), JSON.stringify(sorted), planStart, planEnd, today, Date.now()]
+          );
+          id = rows[0].id;
+        } else if (planStart) {
+          await client.query(
+            'DELETE FROM run_reviews WHERE user_id = $1 AND LEFT(activity_date, 10) BETWEEN $2 AND $3',
+            [userId, planStart, planEnd]
+          );
+        }
+        await client.query('DELETE FROM workouts WHERE user_id = $1', [userId]);
+        await client.query('DELETE FROM training_weeks WHERE user_id = $1', [userId]);
+        await client.query('DELETE FROM marathon_overview WHERE user_id = $1', [userId]);
+        await client.query('COMMIT');
+        return finished ? { archived: id } : { deleted: true };
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      } finally {
+        client.release();
+      }
+    },
+    // Newest first, without the bulky weeks payload
+    async list(userId) {
+      const { rows } = await pool.query(
+        `SELECT id, plan_start, plan_end, archived_on, archived_at,
+                (overview->>'distance_km')::float AS distance_km, overview->>'race_date' AS race_date,
+                overview->>'goal_time' AS goal_time, overview->>'goal_pace' AS goal_pace
+         FROM past_plans WHERE user_id = $1 ORDER BY plan_end DESC, id DESC`,
+        [userId]
+      );
+      return rows;
+    },
+    async find(userId, id) {
+      if (!Number.isSafeInteger(id)) return null;
+      const { rows } = await pool.query('SELECT * FROM past_plans WHERE user_id = $1 AND id = $2', [userId, id]);
+      return rows[0] ?? null;
+    },
+    async remove(userId, id) {
+      if (!Number.isSafeInteger(id)) return false;
+      const { rowCount } = await pool.query('DELETE FROM past_plans WHERE user_id = $1 AND id = $2', [userId, id]);
+      return rowCount > 0;
+    },
+    async removeByUserId(userId) {
+      await pool.query('DELETE FROM past_plans WHERE user_id = $1', [userId]);
     },
   },
 
