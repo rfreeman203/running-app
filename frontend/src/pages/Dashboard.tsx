@@ -121,6 +121,9 @@ export default function Dashboard({ user, onSignOut }: Props) {
   const [revisingGoal, setRevisingGoal] = useState(false);
   const [revisingGoalError, setRevisingGoalError] = useState('');
   const [view, setView] = useState<'overview' | 'calendar' | 'insights'>('overview');
+  // Direction of the last swipe, so the incoming tab slides in from the matching side
+  const [swipeDir, setSwipeDir] = useState<'left' | 'right' | null>(null);
+  const swipeStart = useRef<{ x: number; y: number; t: number } | null>(null);
   const [hasPlan, setHasPlan] = useState(false);
   const [uploadedPlan, setUploadedPlan] = useState<File | null>(null);
   const [showPlanModal, setShowPlanModal] = useState(false);
@@ -332,6 +335,36 @@ export default function Dashboard({ user, onSignOut }: Props) {
     ? `${weeksLeft} week${weeksLeft === 1 ? '' : 's'} left${remainingKm !== null ? ` · ${Math.round(remainingKm)} km` : ''}`
     : '';
 
+  function onSwipeStart(e: React.TouchEvent) {
+    const t = e.touches[0];
+    // Leave gestures inside horizontally scrollable content (wide tables) to that content
+    swipeStart.current = e.touches.length === 1 && !inHorizontalScroller(e.target as Element, e.currentTarget)
+      ? { x: t.clientX, y: t.clientY, t: Date.now() }
+      : null;
+  }
+
+  function onSwipeEnd(e: React.TouchEvent) {
+    const start = swipeStart.current;
+    swipeStart.current = null;
+    if (!start || !hasPlan || loading) return;
+    const t = e.changedTouches[0];
+    const dx = t.clientX - start.x;
+    const dy = t.clientY - start.y;
+    // A deliberate, mostly-horizontal flick — not a vertical scroll that drifted sideways
+    if (Math.abs(dx) < 60 || Math.abs(dx) < Math.abs(dy) * 1.5 || Date.now() - start.t > 800) return;
+    const i = VIEWS.indexOf(view) + (dx < 0 ? 1 : -1);
+    if (i < 0 || i >= VIEWS.length) return;
+    setSwipeDir(dx < 0 ? 'left' : 'right');
+    setView(VIEWS[i]);
+    // On mobile the window scrolls; start the new tab at the top, not mid-way down the old one
+    window.scrollTo({ top: 0 });
+  }
+
+  function selectView(v: typeof view) {
+    setSwipeDir(null);
+    setView(v);
+  }
+
   return (
     <div style={styles.page} className="page-root">
       <header style={styles.header} className="header-inner">
@@ -344,15 +377,15 @@ export default function Dashboard({ user, onSignOut }: Props) {
               <nav style={styles.nav} className="nav-desktop">
                 <button
                   style={{ ...styles.navLink, ...(view === 'overview' ? styles.navLinkActive : {}) }}
-                  onClick={() => setView('overview')}
+                  onClick={() => selectView('overview')}
                 >Overview</button>
                 <button
                   style={{ ...styles.navLink, ...(view === 'calendar' ? styles.navLinkActive : {}) }}
-                  onClick={() => setView('calendar')}
+                  onClick={() => selectView('calendar')}
                 >Calendar</button>
                 <button
                   style={{ ...styles.navLink, ...(view === 'insights' ? styles.navLinkActive : {}) }}
-                  onClick={() => setView('insights')}
+                  onClick={() => selectView('insights')}
                 >Insights</button>
               </nav>
             )}
@@ -420,15 +453,15 @@ export default function Dashboard({ user, onSignOut }: Props) {
             <nav style={styles.nav}>
               <button
                 style={{ ...styles.navLink, ...(view === 'overview' ? styles.navLinkActive : {}) }}
-                onClick={() => setView('overview')}
+                onClick={() => selectView('overview')}
               >Overview</button>
               <button
                 style={{ ...styles.navLink, ...(view === 'calendar' ? styles.navLinkActive : {}) }}
-                onClick={() => setView('calendar')}
+                onClick={() => selectView('calendar')}
               >Calendar</button>
               <button
                 style={{ ...styles.navLink, ...(view === 'insights' ? styles.navLinkActive : {}) }}
-                onClick={() => setView('insights')}
+                onClick={() => selectView('insights')}
               >Insights</button>
             </nav>
             <span style={styles.navMeta}>{planBadgeText}</span>
@@ -436,7 +469,12 @@ export default function Dashboard({ user, onSignOut }: Props) {
         )}
       </header>
 
-      <main style={{ ...styles.main, maxWidth: 'none' }} className="main-content">
+      <main
+        style={{ ...styles.main, maxWidth: 'none' }}
+        className="main-content"
+        onTouchStart={onSwipeStart}
+        onTouchEnd={onSwipeEnd}
+      >
         {loading && <Splash message="Loading your training data…" />}
         {error && <p style={{ color: '#F87171' }}>{error}</p>}
 
@@ -463,7 +501,9 @@ export default function Dashboard({ user, onSignOut }: Props) {
           </div>
         )}
 
-        {!loading && hasPlan && view === 'overview' && (
+        {!loading && hasPlan && (
+          <div key={view} style={styles.viewWrap} className={swipeDir ? `swipe-in-${swipeDir}` : undefined}>
+        {view === 'overview' && (
           <div style={ovStyles.grid} className="ov-grid">
             <div style={ovStyles.leftCol} className="ov-left-col">
               <ThisWeek key={planVersion} activities={activities} dataVersion={dataVersion} />
@@ -483,14 +523,16 @@ export default function Dashboard({ user, onSignOut }: Props) {
           </div>
         )}
 
-        {!loading && hasPlan && view === 'calendar' && (
+        {view === 'calendar' && (
           <CalendarView key={planVersion} dataVersion={dataVersion} />
         )}
 
-        {!loading && hasPlan && view === 'insights' && (
+        {view === 'insights' && (
           <Suspense fallback={<Splash message="Loading insights…" />}>
             <Insights planVersion={planVersion} dataVersion={dataVersion} />
           </Suspense>
+        )}
+          </div>
         )}
       </main>
 
@@ -1976,6 +2018,17 @@ function clearClientCaches() {
   persist.clearAll();
 }
 
+const VIEWS = ['overview', 'calendar', 'insights'] as const;
+
+// True when the touch starts inside something that scrolls sideways (below `root`)
+function inHorizontalScroller(el: Element | null, root: Element) {
+  for (; el && el !== root; el = el.parentElement) {
+    const ox = getComputedStyle(el).overflowX;
+    if ((ox === 'auto' || ox === 'scroll') && el.scrollWidth > el.clientWidth) return true;
+  }
+  return false;
+}
+
 function roundKm(km: number) {
   return Math.round(km * 10) / 10;
 }
@@ -2704,6 +2757,8 @@ const styles: Record<string, React.CSSProperties> = {
   dangerItem: { color: '#F87171' },
   divider: { height: 1, background: 'var(--border)', margin: '0 8px' },
   main: { flex: 1, display: 'flex', flexDirection: 'column', padding: '16px 24px', overflow: 'hidden', minHeight: 0 },
+  // Keyed per tab so a swipe replays the slide-in; passes main's flex layout through
+  viewWrap: { flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 },
   muted: { color: 'var(--text-muted)', textAlign: 'center', padding: 40 },
   overlay: {
     position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',
