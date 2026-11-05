@@ -675,16 +675,18 @@ async function computeInsights(userId, weeks, today) {
 
   // Past plans need no read-through: each was the current plan while syncing, so its runs are stored
   await ensureBackfilled(userId);
+  // Running only: rides/walks/gym sessions and cross-training workouts stay out of every figure
   const activities = today < planStart ? [] : await db.activities.between(userId, planStart, rangeEnd);
-  const activityDates = new Set(activities.map(activityLocalDate));
   const runs = activities.filter(isRunType);
+  const activityDates = new Set(runs.map(activityLocalDate));
+  const runWorkouts = week => (week.workouts ?? []).filter(w => RUN_WORKOUT_TYPES.includes(w.type));
 
   // ── Workout completion ──
   const workoutStatus = { done: 0, made_up: 0, missed: 0, left: 0 };
   const byType = {};
   const weekly = [];
   for (const week of weeks) {
-    const workouts = week.workouts ?? [];
+    const workouts = runWorkouts(week);
     const done = [];
     const missed = [];
     for (const w of workouts) {
@@ -740,7 +742,7 @@ async function computeInsights(userId, weeks, today) {
     runs: 0,
   }));
 
-  const plannedTypeByDate = new Map(weeks.flatMap(w => w.workouts ?? []).map(w => [w.date, w.type]));
+  const plannedTypeByDate = new Map(weeks.flatMap(runWorkouts).map(w => [w.date, w.type]));
   const runRows = runs
     .map(r => {
       const row = {
